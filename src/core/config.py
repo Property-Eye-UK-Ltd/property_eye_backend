@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # Database Configuration
+    # PostgreSQL for production, SQLite for POC (PPD scanning and output only)
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL", "sqlite+aiosqlite:///./fraud_detection.db"
     )
