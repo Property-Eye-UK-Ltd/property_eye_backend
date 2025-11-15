@@ -5,8 +5,7 @@ This module defines all configurable parameters for fraud detection,
 PPD data management, and Land Registry API integration.
 """
 
-import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 
@@ -14,12 +13,11 @@ from typing import List
 class FraudDetectionConfig:
     """Configuration dataclass for fraud detection system parameters."""
 
-    # PPD Storage (from environment variables)
-    PPD_VOLUME_PATH: str = os.getenv("PPD_VOLUME_PATH", "/data/ppd")
-    PPD_COMPRESSION: str = os.getenv("PPD_COMPRESSION", "snappy")  # or "zstd"
-    CSV_VOLUME_PATH: str = os.getenv("CSV_VOLUME_PATH", "./data/csv")
-    SYNC_PPD: bool = os.getenv("SYNC_PPD", "false").lower() in ("true", "1", "yes")
-
+    # PPD Storage (loaded from settings at runtime)
+    PPD_VOLUME_PATH: str = field(default="./data/ppd")
+    PPD_COMPRESSION: str = field(default="snappy")
+    CSV_VOLUME_PATH: str = field(default="./data/csv")
+    SYNC_PPD: bool = field(default=False)
     # PPD Filtering
     SCAN_WINDOW_MONTHS: int = 12  # Check PPD records up to 12 months after withdrawal
 
@@ -37,24 +35,19 @@ class FraudDetectionConfig:
     POSTCODE_MATCH_WEIGHT: float = 0.10  # 10% weight for postcode match
 
     # Required Fields for Agency Document Upload
-    REQUIRED_FIELDS: List[str] = None
-
-    def __post_init__(self):
-        """Initialize fields that need to be mutable."""
-        if self.REQUIRED_FIELDS is None:
-            self.REQUIRED_FIELDS = [
-                "address",
-                "client_name",
-                "status",
-                "withdrawn_date",
-                "postcode",
-            ]
+    REQUIRED_FIELDS: List[str] = field(
+        default_factory=lambda: [
+            "address",
+            "client_name",
+            "status",
+            "withdrawn_date",
+            "postcode",
+        ]
+    )
 
     # Land Registry API Configuration
-    LAND_REGISTRY_API_URL: str = os.getenv(
-        "LAND_REGISTRY_API_URL", "https://api.landregistry.gov.uk"
-    )
-    LAND_REGISTRY_API_KEY: str = os.getenv("LAND_REGISTRY_API_KEY", "")
+    LAND_REGISTRY_API_URL: str = field(default="https://api.landregistry.gov.uk")
+    LAND_REGISTRY_API_KEY: str = field(default="")
     LAND_REGISTRY_TIMEOUT: int = 30  # seconds
     LAND_REGISTRY_MAX_RETRIES: int = 3
 
@@ -67,5 +60,23 @@ class FraudDetectionConfig:
     )
 
 
+# Initialize config with values from settings
+def get_config():
+    """
+    Get fraud detection config populated with environment values.
+    Import settings here to avoid circular imports.
+    """
+    from src.core.config import settings
+
+    return FraudDetectionConfig(
+        PPD_VOLUME_PATH=settings.PPD_VOLUME_PATH,
+        PPD_COMPRESSION=settings.PPD_COMPRESSION,
+        CSV_VOLUME_PATH=settings.CSV_VOLUME_PATH,
+        SYNC_PPD=settings.SYNC_PPD,
+        LAND_REGISTRY_API_URL=settings.LAND_REGISTRY_API_URL,
+        LAND_REGISTRY_API_KEY=settings.LAND_REGISTRY_API_KEY or "",
+    )
+
+
 # Global configuration instance
-config = FraudDetectionConfig()
+config = get_config()

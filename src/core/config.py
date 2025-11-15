@@ -5,7 +5,6 @@ This module uses Pydantic BaseSettings to manage environment-based
 configuration for database connections, API keys, and application settings.
 """
 
-import os
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -29,24 +28,20 @@ class Settings(BaseSettings):
 
     # Database Configuration
     # PostgreSQL for production, SQLite for POC (PPD scanning and output only)
-    DATABASE_URL: str = os.getenv(
-        "DATABASE_URL", "sqlite+aiosqlite:///./fraud_detection.db"
-    )
+    DATABASE_URL: str = "sqlite+aiosqlite:///./fraud_detection.db"
 
     # PPD Storage Configuration
-    PPD_VOLUME_PATH: str = os.getenv("PPD_VOLUME_PATH", "./data/ppd")
-    PPD_COMPRESSION: str = os.getenv("PPD_COMPRESSION", "snappy")
-    CSV_VOLUME_PATH: str = os.getenv("CSV_VOLUME_PATH", "./data/csv")
-    SYNC_PPD: bool = os.getenv("SYNC_PPD", "false").lower() in ("true", "1", "yes")
+    PPD_VOLUME_PATH: str = "./data/ppd"
+    PPD_COMPRESSION: str = "snappy"
+    CSV_VOLUME_PATH: str = "./data/csv"
+    SYNC_PPD: bool = False
 
     # Land Registry API Configuration
-    LAND_REGISTRY_API_KEY: Optional[str] = os.getenv("LAND_REGISTRY_API_KEY")
-    LAND_REGISTRY_API_URL: str = os.getenv(
-        "LAND_REGISTRY_API_URL", "https://api.landregistry.gov.uk"
-    )
+    LAND_REGISTRY_API_KEY: Optional[str] = None
+    LAND_REGISTRY_API_URL: str = "https://api.landregistry.gov.uk"
 
     # Redis Configuration (for future caching)
-    REDIS_URL: Optional[str] = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     # CORS Configuration
     CORS_ORIGINS: list = ["*"]  # Configure appropriately for production
@@ -59,7 +54,7 @@ class Settings(BaseSettings):
     ALLOWED_UPLOAD_EXTENSIONS: list = [".csv", ".xlsx", ".xls", ".pdf"]
 
     # Logging Configuration
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    LOG_LEVEL: str = "INFO"
 
 
 # Global settings instance
