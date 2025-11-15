@@ -17,6 +17,8 @@ class FraudDetectionConfig:
     # PPD Storage (from environment variables)
     PPD_VOLUME_PATH: str = os.getenv("PPD_VOLUME_PATH", "/data/ppd")
     PPD_COMPRESSION: str = os.getenv("PPD_COMPRESSION", "snappy")  # or "zstd"
+    CSV_VOLUME_PATH: str = os.getenv("CSV_VOLUME_PATH", "./data/csv")
+    SYNC_PPD: bool = os.getenv("SYNC_PPD", "false").lower() in ("true", "1", "yes")
 
     # PPD Filtering
     SCAN_WINDOW_MONTHS: int = 12  # Check PPD records up to 12 months after withdrawal

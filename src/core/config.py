@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     # PPD Storage Configuration
     PPD_VOLUME_PATH: str = os.getenv("PPD_VOLUME_PATH", "./data/ppd")
     PPD_COMPRESSION: str = os.getenv("PPD_COMPRESSION", "snappy")
+    CSV_VOLUME_PATH: str = os.getenv("CSV_VOLUME_PATH", "./data/csv")
+    SYNC_PPD: bool = os.getenv("SYNC_PPD", "false").lower() in ("true", "1", "yes")
 
     # Land Registry API Configuration
     LAND_REGISTRY_API_KEY: Optional[str] = os.getenv("LAND_REGISTRY_API_KEY")

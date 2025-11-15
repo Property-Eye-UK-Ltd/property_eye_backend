@@ -112,6 +112,34 @@ async def startup_event():
     else:
         logger.info(f"PPD volume path verified: {ppd_volume}")
 
+    # Verify CSV volume path exists
+    csv_volume = Path(config.CSV_VOLUME_PATH)
+    if not csv_volume.exists():
+        logger.info(f"Creating CSV volume directory: {csv_volume}")
+        csv_volume.mkdir(parents=True, exist_ok=True)
+    else:
+        logger.info(f"CSV volume path verified: {csv_volume}")
+
+    # Auto-sync PPD data if enabled
+    if config.SYNC_PPD:
+        logger.info("SYNC_PPD enabled - starting automatic PPD ingestion")
+        from src.services.ppd_sync_service import PPDSyncService
+
+        sync_service = PPDSyncService()
+        sync_summary = await sync_service.sync_ppd_data()
+
+        logger.info(
+            f"PPD sync complete: {sync_summary['newly_ingested']} new files ingested, "
+            f"{sync_summary['already_ingested']} already processed, "
+            f"{sync_summary['failed']} failed"
+        )
+
+        if sync_summary["errors"]:
+            for error in sync_summary["errors"]:
+                logger.error(f"  - {error}")
+    else:
+        logger.info("SYNC_PPD disabled - skipping automatic PPD ingestion")
+
     logger.info("Application startup complete")
 
 

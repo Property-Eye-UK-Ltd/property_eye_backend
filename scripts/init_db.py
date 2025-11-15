@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.db.base import Base, engine
-from src.models import Agency, FraudMatch, PropertyListing  # noqa: F401
+from src.models import Agency, FraudMatch, PPDIngestHistory, PropertyListing  # noqa: F401
 
 
 async def init_db():

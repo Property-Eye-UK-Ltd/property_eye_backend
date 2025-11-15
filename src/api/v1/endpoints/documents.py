@@ -5,6 +5,7 @@ Handles agency document uploads with field mapping and validation.
 """
 
 import logging
+import pandas as pd
 import uuid
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -51,15 +52,6 @@ async def upload_document(
 ):
     """
     Upload and process agency document.
-
-    Args:
-        agency_id: Agency identifier
-        field_mapping: JSON string with column mapping
-        file: Uploaded file
-        db: Database session
-
-    Returns:
-        DocumentUploadResponse with processing summary
     """
     logger.info(f"Received document upload for agency {agency_id}")
 
@@ -116,7 +108,7 @@ async def upload_document(
 
         # Parse document
         parser = DocumentParser()
-        df = await parser.parse(
+        df: pd.DataFrame     = await parser.parse(
             file_path=temp_file_path,
             file_type=file_extension,
             field_mapping=field_mapping_dict,
