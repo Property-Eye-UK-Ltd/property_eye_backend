@@ -48,8 +48,8 @@ app = FastAPI(
     - Two-stage verification to minimize API costs
     """,
     version=settings.APP_VERSION,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    redoc_url="/docs",
+    # docs_url="/docs",
 )
 
 # Configure CORS for future frontend integration
