@@ -15,6 +15,7 @@ from src.schemas.fraud_report import (
     SuspiciousMatchSummary,
     ConfidenceDistribution,
 )
+from src.schemas.ppd_upload import PPDUploadResponse, PPDUploadStatusResponse
 from src.schemas.verification import (
     VerificationRequest,
     VerificationResult,
@@ -32,6 +33,8 @@ __all__ = [
     "FraudMatchSchema",
     "SuspiciousMatchSummary",
     "ConfidenceDistribution",
+    "PPDUploadResponse",
+    "PPDUploadStatusResponse",
     "VerificationRequest",
     "VerificationResult",
     "VerificationSummary",
