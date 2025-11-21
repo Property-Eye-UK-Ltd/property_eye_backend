@@ -9,3 +9,8 @@ Property Address,Client Full Name,Status,Date Withdrawn,Postcode
 67 Piccadilly,Linda Martinez,withdrawn,2025-02-10,W1J 0BL
 90 Victoria Street,David Anderson,active,2025-01-18,SW1E 5JL
 23 Kensington High Street,Sarah Taylor,withdrawn,2025-01-22,W8 5NP
+24 Wick St Lawrence	Weston-Super-Mare	North Somerset	North Somerset,Sarah Taylor,withdrawn,2025-01-22,W8 5NP
+
+
+
+{"Property Address":"address","Client Full Name":"client_name","Status":"status","Date Withdrawn":"withdrawn_date","Postcode":"postcode"}

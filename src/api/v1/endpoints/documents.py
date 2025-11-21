@@ -7,6 +7,7 @@ Handles agency document uploads with field mapping and validation.
 import logging
 import pandas as pd
 import uuid
+from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict
@@ -26,6 +27,38 @@ from src.utils.constants import config
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+
+def parse_date(date_value) -> datetime.date:
+    """
+    Parse date from various formats to datetime.date object.
+    
+    Args:
+        date_value: Date value (string, datetime, or date object)
+        
+    Returns:
+        datetime.date object or None
+    """
+    if pd.isna(date_value) or date_value is None:
+        return None
+    
+    if isinstance(date_value, datetime):
+        return date_value.date()
+    
+    if isinstance(date_value, pd.Timestamp):
+        return date_value.date()
+    
+    if isinstance(date_value, str):
+        # Try common date formats
+        for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"]:
+            try:
+                return datetime.strptime(date_value, fmt).date()
+            except ValueError:
+                continue
+        # If none work, raise error
+        raise ValueError(f"Unable to parse date: {date_value}")
+    
+    return date_value
 
 
 @router.post(
@@ -139,6 +172,9 @@ async def upload_document(
                 records_skipped += 1
                 continue
 
+            # Parse withdrawn_date to proper date object
+            withdrawn_date = parse_date(row.get("withdrawn_date"))
+
             # Create new property listing
             property_listing = PropertyListing(
                 agency_id=agency_id,
@@ -147,7 +183,7 @@ async def upload_document(
                 postcode=str(row.get("postcode", "")),
                 client_name=str(row.get("client_name", "")),
                 status=str(row.get("status", "")).lower(),
-                withdrawn_date=row.get("withdrawn_date"),
+                withdrawn_date=withdrawn_date,
             )
 
             db.add(property_listing)

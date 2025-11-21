@@ -45,6 +45,11 @@ class FraudDetectionConfig:
         ]
     )
 
+    # Allowed Upload File Extensions
+    ALLOWED_UPLOAD_EXTENSIONS: List[str] = field(
+        default_factory=lambda: [".csv", ".xlsx", ".xls", ".pdf"]
+    )
+
     # Land Registry API Configuration
     LAND_REGISTRY_API_URL: str = field(default="https://api.landregistry.gov.uk")
     LAND_REGISTRY_API_KEY: str = field(default="")
