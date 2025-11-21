@@ -6,6 +6,7 @@ configuration for database connections, API keys, and application settings.
 """
 
 from typing import Optional
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +30,17 @@ class Settings(BaseSettings):
     # Database Configuration
     # PostgreSQL for production, SQLite for POC (PPD scanning and output only)
     DATABASE_URL: str = "sqlite+aiosqlite:///./fraud_detection.db"
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def assemble_db_connection(cls, v: str) -> str:
+        """
+        Ensure the database URL uses the asyncpg driver for PostgreSQL.
+        Railway provides 'postgresql://', but SQLAlchemy async engine needs 'postgresql+asyncpg://'.
+        """
+        if v and v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
 
     # PPD Storage Configuration
     # For Railway: use /data (mounted volume), for local: use ./data/ppd
