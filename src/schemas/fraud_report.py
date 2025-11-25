@@ -40,6 +40,9 @@ class FraudMatchSchema(BaseModel):
     address_similarity: float = Field(
         ..., description="Address similarity score (0-100)"
     )
+    risk_level: Optional[str] = Field(
+        None, description="Risk level: CRITICAL, HIGH, MEDIUM, LOW"
+    )
 
     # Verification details
     verification_status: str = Field(

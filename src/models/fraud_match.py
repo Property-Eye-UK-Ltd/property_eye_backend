@@ -66,6 +66,7 @@ class FraudMatch(Base):
     # Match details
     confidence_score = Column(Float)  # 0-100
     address_similarity = Column(Float)  # 0-100
+    risk_level = Column(String, nullable=True)  # CRITICAL, HIGH, MEDIUM, LOW
 
     # Verification status: suspicious, confirmed_fraud, not_fraud, error
     verification_status = Column(

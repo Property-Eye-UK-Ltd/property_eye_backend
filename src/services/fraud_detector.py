@@ -146,6 +146,7 @@ class FraudDetector:
                 ppd_full_address=m.ppd_full_address,
                 confidence_score=m.confidence_score,
                 address_similarity=m.address_similarity,
+                risk_level=m.risk_level,
                 verification_status=m.verification_status,
                 verified_owner_name=m.verified_owner_name,
                 is_confirmed_fraud=m.is_confirmed_fraud,
@@ -206,6 +207,13 @@ class FraudDetector:
                 property, ppd_row, address_similarity
             )
 
+            # Calculate risk level
+            risk_level = "LOW"
+            if property.withdrawn_date and pd.notna(ppd_row.get("transfer_date")):
+                ppd_date = pd.to_datetime(ppd_row["transfer_date"])
+                days_diff = abs((ppd_date - property.withdrawn_date).days)
+                risk_level = self._calculate_risk_level(days_diff, confidence_score)
+
             # Store if above minimum confidence threshold
             if confidence_score >= config.MIN_CONFIDENCE_THRESHOLD:
                 fraud_match = FraudMatch(
@@ -217,6 +225,7 @@ class FraudDetector:
                     ppd_full_address=str(ppd_row.get("full_address", "")),
                     confidence_score=confidence_score,
                     address_similarity=address_similarity,
+                    risk_level=risk_level,
                     verification_status="suspicious",
                     is_confirmed_fraud=False,
                     detected_at=datetime.utcnow(),
@@ -235,6 +244,28 @@ class FraudDetector:
                 match.property_listing = property
 
         return matches
+
+    def _calculate_risk_level(self, days_diff: int, confidence_score: float) -> str:
+        """
+        Calculate risk level based on date difference and confidence.
+
+        Levels:
+        - CRITICAL: 1-6 months (approx 180 days)
+        - HIGH: 6 months - 1 year (approx 365 days)
+        - MEDIUM: 1-3 years (approx 1095 days)
+        - LOW: 3-6 years (approx 2190 days)
+        """
+        # Adjust based on confidence if needed, for now strictly date based as requested
+        # but ensuring high confidence for Critical/High
+
+        if days_diff <= 180:
+            return "CRITICAL"
+        elif days_diff <= 365:
+            return "HIGH"
+        elif days_diff <= 1095:
+            return "MEDIUM"
+        else:
+            return "LOW"
 
     def _calculate_confidence_score(
         self, property: PropertyListing, ppd_row: pd.Series, address_similarity: float

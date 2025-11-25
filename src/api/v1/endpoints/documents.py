@@ -211,3 +211,38 @@ async def upload_document(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process document: {str(e)}",
         )
+
+
+@router.get(
+    "/listings",
+    response_model=list[dict],
+    status_code=status.HTTP_200_OK,
+    summary="Get uploaded listings",
+    description="Get all property listings uploaded by the current agency.",
+)
+async def get_uploaded_listings(
+    current_agency: Agency = Depends(deps.get_current_agency),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get all uploaded listings for the current agency.
+    """
+    stmt = select(PropertyListing).where(
+        PropertyListing.agency_id == current_agency.id
+    ).order_by(PropertyListing.created_at.desc())
+    
+    result = await db.execute(stmt)
+    listings = result.scalars().all()
+    
+    return [
+        {
+            "id": l.id,
+            "address": l.address,
+            "postcode": l.postcode,
+            "client_name": l.client_name,
+            "status": l.status,
+            "withdrawn_date": l.withdrawn_date,
+            "created_at": l.created_at,
+        }
+        for l in listings
+    ]
