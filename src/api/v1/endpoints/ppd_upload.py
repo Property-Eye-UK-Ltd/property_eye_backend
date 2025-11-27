@@ -197,3 +197,28 @@ async def list_uploads(
         )
         for job in jobs
     ]
+
+
+@router.delete(
+    "/upload/{upload_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete PPD upload",
+    description="Delete a PPD upload job and its associated files (CSV and Parquet).",
+)
+async def delete_upload(
+    upload_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete upload job and files.
+    """
+    service = PPDUploadService()
+    success = await service.delete_upload(upload_id)
+
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload job {upload_id} not found or could not be deleted",
+        )
+
+    return None
