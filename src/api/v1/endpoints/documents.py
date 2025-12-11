@@ -33,22 +33,22 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 def parse_date(date_value) -> datetime.date:
     """
     Parse date from various formats to datetime.date object.
-    
+
     Args:
         date_value: Date value (string, datetime, or date object)
-        
+
     Returns:
         datetime.date object or None
     """
     if pd.isna(date_value) or date_value is None:
         return None
-    
+
     if isinstance(date_value, datetime):
         return date_value.date()
-    
+
     if isinstance(date_value, pd.Timestamp):
         return date_value.date()
-    
+
     if isinstance(date_value, str):
         # Try common date formats
         for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"]:
@@ -58,7 +58,7 @@ def parse_date(date_value) -> datetime.date:
                 continue
         # If none work, raise error
         raise ValueError(f"Unable to parse date: {date_value}")
-    
+
     return date_value
 
 
@@ -227,13 +227,15 @@ async def get_uploaded_listings(
     """
     Get all uploaded listings for the current agency.
     """
-    stmt = select(PropertyListing).where(
-        PropertyListing.agency_id == current_agency.id
-    ).order_by(PropertyListing.created_at.desc())
-    
+    stmt = (
+        select(PropertyListing)
+        .where(PropertyListing.agency_id == current_agency.id)
+        .order_by(PropertyListing.created_at.desc())
+    )
+
     result = await db.execute(stmt)
     listings = result.scalars().all()
-    
+
     return [
         {
             "id": l.id,
@@ -246,3 +248,157 @@ async def get_uploaded_listings(
         }
         for l in listings
     ]
+
+
+@router.patch(
+    "/listings/{listing_id}",
+    response_model=dict,
+    status_code=status.HTTP_200_OK,
+    summary="Update a property listing",
+    description="Update specific fields of a property listing record.",
+)
+async def update_listing(
+    listing_id: str,
+    update_data: dict,
+    current_agency: Agency = Depends(deps.get_current_agency),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update a property listing record.
+
+    Args:
+        listing_id: Property listing ID to update
+        update_data: Dictionary of fields to update
+        current_agency: Authenticated agency
+        db: Database session
+
+    Returns:
+        Updated property listing object
+    """
+    agency_id = current_agency.id
+    logger.info(f"Updating listing {listing_id} for agency {agency_id}")
+
+    try:
+        # Get the listing and verify ownership
+        stmt = select(PropertyListing).where(
+            PropertyListing.id == listing_id, PropertyListing.agency_id == agency_id
+        )
+
+        result = await db.execute(stmt)
+        listing = result.scalar_one_or_none()
+
+        if not listing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Listing {listing_id} not found or access denied",
+            )
+
+        # Update allowed fields
+        allowed_fields = {
+            "address",
+            "postcode",
+            "client_name",
+            "status",
+            "withdrawn_date",
+        }
+
+        address_normalizer = AddressNormalizer()
+
+        for field, value in update_data.items():
+            if field in allowed_fields and hasattr(listing, field):
+                if field == "withdrawn_date" and value:
+                    # Parse date if it's a string
+                    setattr(listing, field, parse_date(value))
+                else:
+                    setattr(listing, field, value)
+
+        # Re-normalize address if address or postcode changed
+        if "address" in update_data or "postcode" in update_data:
+            listing.normalized_address = address_normalizer.normalize(
+                listing.address, listing.postcode
+            )
+
+        await db.commit()
+        await db.refresh(listing)
+
+        return {
+            "id": listing.id,
+            "address": listing.address,
+            "postcode": listing.postcode,
+            "client_name": listing.client_name,
+            "status": listing.status,
+            "withdrawn_date": listing.withdrawn_date,
+            "created_at": listing.created_at,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating listing: {str(e)}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update listing: {str(e)}",
+        )
+
+
+@router.delete(
+    "/listings/{listing_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a property listing",
+    description="Delete a property listing record and all associated fraud matches.",
+)
+async def delete_listing(
+    listing_id: str,
+    current_agency: Agency = Depends(deps.get_current_agency),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a property listing record.
+
+    Args:
+        listing_id: Property listing ID to delete
+        current_agency: Authenticated agency
+        db: Database session
+
+    Returns:
+        None (204 No Content)
+    """
+    from sqlalchemy import delete as sql_delete
+
+    agency_id = current_agency.id
+    logger.info(f"Deleting listing {listing_id} for agency {agency_id}")
+
+    try:
+        # Verify ownership before deletion
+        stmt = select(PropertyListing).where(
+            PropertyListing.id == listing_id, PropertyListing.agency_id == agency_id
+        )
+
+        result = await db.execute(stmt)
+        listing = result.scalar_one_or_none()
+
+        if not listing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Listing {listing_id} not found or access denied",
+            )
+
+        # Delete the record (cascade will handle fraud_matches)
+        delete_stmt = sql_delete(PropertyListing).where(
+            PropertyListing.id == listing_id
+        )
+        await db.execute(delete_stmt)
+        await db.commit()
+
+        logger.info(f"Successfully deleted listing {listing_id}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting listing: {str(e)}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete listing: {str(e)}",
+        )

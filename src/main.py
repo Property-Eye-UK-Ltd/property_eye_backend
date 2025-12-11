@@ -14,6 +14,7 @@ from src.api.v1.endpoints import (
     auth,
     documents,
     fraud_reports,
+    integrations_alto,
     ppd_upload,
     verification,
 )

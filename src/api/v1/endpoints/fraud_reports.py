@@ -5,6 +5,7 @@ Handles fraud detection scans to identify suspicious matches.
 """
 
 import logging
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -174,4 +175,170 @@ async def get_fraud_reports(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve fraud reports: {str(e)}",
+        )
+
+
+@router.patch(
+    "/reports/{report_id}",
+    response_model=FraudMatchSchema,
+    status_code=status.HTTP_200_OK,
+    summary="Update a fraud report",
+    description="Update specific fields of a fraud report record.",
+)
+async def update_fraud_report(
+    report_id: str,
+    update_data: dict,
+    current_agency: Agency = Depends(deps.get_current_agency),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update a fraud report record.
+
+    Args:
+        report_id: Fraud report ID to update
+        update_data: Dictionary of fields to update
+        current_agency: Authenticated agency
+        db: Database session
+
+    Returns:
+        Updated FraudMatchSchema object
+    """
+    from sqlalchemy import select
+    from sqlalchemy.orm import joinedload
+    from src.models.fraud_match import FraudMatch
+    from src.models.property_listing import PropertyListing
+
+    agency_id = current_agency.id
+    logger.info(f"Updating fraud report {report_id} for agency {agency_id}")
+
+    try:
+        # Get the fraud match and verify ownership
+        stmt = (
+            select(FraudMatch)
+            .options(joinedload(FraudMatch.property_listing))
+            .join(PropertyListing)
+            .where(FraudMatch.id == report_id)
+            .where(PropertyListing.agency_id == agency_id)
+        )
+
+        result = await db.execute(stmt)
+        fraud_match = result.scalar_one_or_none()
+
+        if not fraud_match:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Fraud report {report_id} not found or access denied",
+            )
+
+        # Update allowed fields
+        allowed_fields = {
+            "verification_status",
+            "verified_owner_name",
+            "is_confirmed_fraud",
+        }
+
+        for field, value in update_data.items():
+            if field in allowed_fields and hasattr(fraud_match, field):
+                setattr(fraud_match, field, value)
+
+        if "verification_status" in update_data or "is_confirmed_fraud" in update_data:
+            fraud_match.verified_at = datetime.utcnow()
+
+        await db.commit()
+        await db.refresh(fraud_match)
+
+        # Return updated schema
+        return FraudMatchSchema(
+            id=fraud_match.id,
+            property_listing_id=fraud_match.property_listing_id,
+            property_address=fraud_match.property_listing.address,
+            client_name=fraud_match.property_listing.client_name,
+            withdrawn_date=fraud_match.property_listing.withdrawn_date,
+            ppd_transaction_id=fraud_match.ppd_transaction_id,
+            ppd_price=fraud_match.ppd_price,
+            ppd_transfer_date=fraud_match.ppd_transfer_date,
+            ppd_postcode=fraud_match.ppd_postcode,
+            ppd_full_address=fraud_match.ppd_full_address,
+            confidence_score=fraud_match.confidence_score,
+            address_similarity=fraud_match.address_similarity,
+            verification_status=fraud_match.verification_status,
+            verified_owner_name=fraud_match.verified_owner_name,
+            is_confirmed_fraud=fraud_match.is_confirmed_fraud,
+            detected_at=fraud_match.detected_at,
+            verified_at=fraud_match.verified_at,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating fraud report: {str(e)}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update fraud report: {str(e)}",
+        )
+
+
+@router.delete(
+    "/reports/{report_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a fraud report",
+    description="Delete a fraud report record.",
+)
+async def delete_fraud_report(
+    report_id: str,
+    current_agency: Agency = Depends(deps.get_current_agency),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a fraud report record.
+
+    Args:
+        report_id: Fraud report ID to delete
+        current_agency: Authenticated agency
+        db: Database session
+
+    Returns:
+        None (204 No Content)
+    """
+    from sqlalchemy import select, delete
+    from src.models.fraud_match import FraudMatch
+    from src.models.property_listing import PropertyListing
+
+    agency_id = current_agency.id
+    logger.info(f"Deleting fraud report {report_id} for agency {agency_id}")
+
+    try:
+        # Verify ownership before deletion
+        stmt = (
+            select(FraudMatch)
+            .join(PropertyListing)
+            .where(FraudMatch.id == report_id)
+            .where(PropertyListing.agency_id == agency_id)
+        )
+
+        result = await db.execute(stmt)
+        fraud_match = result.scalar_one_or_none()
+
+        if not fraud_match:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Fraud report {report_id} not found or access denied",
+            )
+
+        # Delete the record
+        delete_stmt = delete(FraudMatch).where(FraudMatch.id == report_id)
+        await db.execute(delete_stmt)
+        await db.commit()
+
+        logger.info(f"Successfully deleted fraud report {report_id}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting fraud report: {str(e)}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete fraud report: {str(e)}",
         )
