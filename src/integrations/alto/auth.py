@@ -2,10 +2,20 @@ import time
 import logging
 import httpx
 import asyncio
+import base64
 from typing import Optional
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def generate_basic_auth_token(client_id: str, client_secret: str) -> str:
+    """
+    Generates the Basic Authorization token by concatenating Client ID and Client Secret
+    separated by a colon, and then Base64 encoding the result.
+    """
+    credentials = f"{client_id}:{client_secret}"
+    return base64.b64encode(credentials.encode()).decode("utf-8")
 
 
 class AltoAuthClient:
@@ -54,27 +64,27 @@ class AltoAuthClient:
             raise ValueError("Alto CLIENT_ID and CLIENT_SECRET must be configured.")
 
         try:
+            basic_auth = generate_basic_auth_token(
+                self.settings.ALTO_CLIENT_ID, self.settings.ALTO_CLIENT_SECRET
+            )
+
             async with httpx.AsyncClient() as client:
-                # Using client_credentials flow as is standard for backend integrations
+                # Using client_credentials flow with Basic Auth
                 response = await client.post(
                     self.settings.alto_auth_url,
                     data={
                         "grant_type": "client_credentials",
-                        "client_id": self.settings.ALTO_CLIENT_ID,
-                        "client_secret": self.settings.ALTO_CLIENT_SECRET,
-                        "scope": "api",  # Adjust scope if needed based on docs
                     },
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Authorization": f"Basic {basic_auth}",
+                    },
                 )
 
                 if response.status_code != 200:
                     logger.error(
                         f"Failed to authenticate with Alto: {response.status_code} - {response.text}"
                     )
-                    data = response.json()
-                    logger.error(data)
-                    logger.error(response.headers)
-                    exit(1)
                     response.raise_for_status()
 
                 data = response.json()
