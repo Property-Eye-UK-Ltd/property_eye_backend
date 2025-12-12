@@ -87,6 +87,7 @@ class AltoApiClient:
 
         except httpx.HTTPError as e:
             logger.error(f"HTTP error in list_properties: {str(e)}")
+
             raise
 
     async def get_property(

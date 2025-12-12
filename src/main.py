@@ -79,6 +79,7 @@ app.include_router(fraud_reports.router, prefix=settings.API_V1_PREFIX)
 app.include_router(ppd_upload.router, prefix=settings.API_V1_PREFIX)
 app.include_router(verification.router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin_alto.router, prefix=settings.API_V1_PREFIX)
+app.include_router(integrations_alto.router, prefix=settings.API_V1_PREFIX)
 app.include_router(alto_router, prefix="/internal/alto", tags=["Internal Alto"])
 
 

@@ -71,6 +71,10 @@ class AltoAuthClient:
                     logger.error(
                         f"Failed to authenticate with Alto: {response.status_code} - {response.text}"
                     )
+                    data = response.json()
+                    logger.error(data)
+                    logger.error(response.headers)
+                    exit(1)
                     response.raise_for_status()
 
                 data = response.json()

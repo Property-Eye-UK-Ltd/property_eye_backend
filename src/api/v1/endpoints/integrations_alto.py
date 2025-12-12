@@ -3,16 +3,16 @@ Alto integration import endpoint for importing properties from Alto into Propert
 """
 
 import logging
-from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from pydantic import BaseModel
 
 from src.db.session import get_db
 from src.api import deps
 from src.models.agency import Agency
+from src.models.property_listing import PropertyListing
 from src.integrations.alto.client import alto_api_client
-from src.services.agency_service import AgencyService
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -65,28 +65,115 @@ async def import_alto_properties(
             page_size=100,  # Fetch up to 100 properties
         )
 
-        # TODO: Parse Alto response and save to PropertyListing table
-        # For now, we'll return the count from the response
-        # The actual implementation would involve:
-        # 1. Parse alto_response to extract property data
-        # 2. Map Alto fields to PropertyListing fields
-        # 3. Create PropertyListing records in database
-        # 4. Handle duplicates (skip or update)
+        # Parse Alto response - handle different response formats
+        properties_data = []
+        if isinstance(alto_response, dict):
+            # Check for common API response patterns
+            if "properties" in alto_response:
+                properties_data = alto_response["properties"]
+            elif (
+                "_embedded" in alto_response
+                and "properties" in alto_response["_embedded"]
+            ):
+                properties_data = alto_response["_embedded"]["properties"]
+            elif "data" in alto_response:
+                properties_data = alto_response["data"]
+            else:
+                # Might be a direct list or other structure
+                properties_data = alto_response.get("items", [])
+        elif isinstance(alto_response, list):
+            properties_data = alto_response
 
-        properties_count = len(
-            alto_response.get("properties", [])
-            if isinstance(alto_response, dict)
-            else []
+        logger.info(f"Found {len(properties_data)} properties in Alto response")
+
+        # Import properties into database
+        properties_imported = 0
+        properties_skipped = 0
+        errors = []
+
+        for prop_data in properties_data:
+            try:
+                # Extract address components
+                address_obj = prop_data.get("address", {})
+                if isinstance(address_obj, dict):
+                    address_parts = [
+                        address_obj.get("address_line_1", ""),
+                        address_obj.get("address_line_2", ""),
+                        address_obj.get("town", ""),
+                    ]
+                    full_address = ", ".join([p for p in address_parts if p])
+                    postcode = address_obj.get("postcode", "")
+                else:
+                    # Fallback if address is a string
+                    full_address = (
+                        str(address_obj) if address_obj else "Unknown Address"
+                    )
+                    postcode = ""
+
+                # Skip if no meaningful address
+                if not full_address or full_address == "Unknown Address":
+                    properties_skipped += 1
+                    continue
+
+                # Map Alto status to our status
+                alto_status = prop_data.get("status", "").lower()
+                status_mapping = {
+                    "available": "active",
+                    "sold": "sold",
+                    "withdrawn": "withdrawn",
+                    "under_offer": "active",
+                    "let": "sold",
+                }
+                property_status = status_mapping.get(alto_status, "active")
+
+                # Check if property already exists (by address and postcode)
+                existing_stmt = select(PropertyListing).where(
+                    PropertyListing.agency_id == current_agency.id,
+                    PropertyListing.address == full_address,
+                    PropertyListing.postcode == postcode,
+                )
+                existing_result = await db.execute(existing_stmt)
+                existing_property = existing_result.scalar_one_or_none()
+
+                if existing_property:
+                    # Skip duplicates
+                    properties_skipped += 1
+                    logger.debug(f"Skipping duplicate property: {full_address}")
+                    continue
+
+                # Create new property listing
+                new_listing = PropertyListing(
+                    agency_id=current_agency.id,
+                    address=full_address,
+                    normalized_address=full_address.lower().strip(),
+                    postcode=postcode,
+                    client_name="Alto Import",  # Default since Alto doesn't provide client name
+                    status=property_status,
+                    withdrawn_date=None,  # Could parse from updated_at if status is withdrawn
+                )
+
+                db.add(new_listing)
+                properties_imported += 1
+
+            except Exception as e:
+                error_msg = f"Error importing property: {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+                continue
+
+        # Commit all new listings
+        await db.commit()
+
+        logger.info(
+            f"Successfully imported {properties_imported} properties, skipped {properties_skipped}"
         )
-
-        logger.info(f"Successfully fetched {properties_count} properties from Alto")
 
         return AltoImportResponse(
             success=True,
-            properties_imported=properties_count,
-            properties_skipped=0,
-            message=f"Successfully imported {properties_count} properties from Alto ({current_env} mode)",
-            errors=[],
+            properties_imported=properties_imported,
+            properties_skipped=properties_skipped,
+            message=f"Successfully imported {properties_imported} properties from Alto ({current_env} mode). {properties_skipped} duplicates skipped.",
+            errors=errors,
         )
 
     except ValueError as e:

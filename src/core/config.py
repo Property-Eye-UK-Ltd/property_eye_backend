@@ -78,16 +78,18 @@ class Settings(BaseSettings):
     ALTO_ENV: str = "sandbox"  # "sandbox" or "production"
 
     # Sandbox defaults
-    ALTO_SANDBOX_AUTH_URL: str = "https://oauth.zoopla.co.uk/oauth/token"
-    ALTO_SANDBOX_API_BASE: str = "https://mobile-api.zoopla.co.uk/sandbox/v1"
+    # ALTO_SANDBOX_AUTH_URL: str = "https://www.zoopla.co.uk/oauth/token"
+    # ALTO_SANDBOX_API_BASE: str = "https://mobile-api.zoopla.co.uk/sandbox/v1"
+    ALTO_SANDBOX_AUTH_URL: str = "https://api.alto.zoopladev.co.uk/token"
+    ALTO_SANDBOX_API_BASE: str = "https://mobile-api.zoopla.co.uk"
 
     # Production defaults
-    ALTO_PRODUCTION_AUTH_URL: str = "https://oauth.zoopla.co.uk/oauth/token"
+    ALTO_PRODUCTION_AUTH_URL: str = "https://www.zoopla.co.uk/oauth/token"
     ALTO_PRODUCTION_API_BASE: str = "https://mobile-api.zoopla.co.uk/v1"
 
-    ALTO_CLIENT_ID: str = ""
-    ALTO_CLIENT_SECRET: str = ""
-    ALTO_INTEGRATION_ID: str = ""
+    ALTO_CLIENT_ID: str
+    ALTO_CLIENT_SECRET: str
+    ALTO_INTEGRATION_ID: str
 
     # # Optional: per-agency identifiers if needed globally
     # ALTO_DEFAULT_AGENCY_ID: Optional[str] = None
