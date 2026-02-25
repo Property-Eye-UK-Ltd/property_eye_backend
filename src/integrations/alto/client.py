@@ -48,25 +48,29 @@ class AltoApiClient:
         page_size: int = 20,
     ) -> Dict[str, Any]:
         """
-        Fetches a list of properties from Alto.
+        Fetches a list of properties from Alto using the /listing/filter endpoint.
 
         Args:
             alto_agency_ref: Agency reference for production environment.
-            branch_id: Optional branch ID to filter by.
-            status: Optional status to filter by (e.g., 'available', 'withdrawn').
-            page: Page number.
-            page_size: Number of results per page.
+            branch_id: Optional branch ID to filter by (param: branchId).
+            status: Optional status to filter by (param: status).
+            page: Page number (param: pageNumber).
+            page_size: Number of results per page (param: pageSize).
 
         Returns:
-            JSON response from the API.
+            JSON response from the API containing the list of properties.
         """
-        url = f"{self.settings.alto_api_base_url}/properties"  # Verify endpoint path
+        url = f"{self.settings.alto_api_base_url}/listing/filter"
 
-        params = {"pageNumber": page, "pageSize": page_size}
+        # Parameters as per Alto /listing/filter documentation
+        params: Dict[str, Any] = {
+            "pageNumber": page,
+            "pageSize": page_size,
+        }
 
-        if branch_id:
+        if branch_id is not None:
             params["branchId"] = branch_id
-        if status:
+        if status is not None:
             params["status"] = status
 
         # Add other filters as needed
@@ -87,16 +91,15 @@ class AltoApiClient:
 
         except httpx.HTTPError as e:
             logger.error(f"HTTP error in list_properties: {str(e)}")
-
             raise
 
     async def get_property(
         self, property_id: str, alto_agency_ref: Optional[str] = None
     ) -> AltoProperty:
         """
-        Fetches a single property by ID.
+        Fetches a single property by ID using the /listing/property/{propertyId} endpoint.
         """
-        url = f"{self.settings.alto_api_base_url}/properties/{property_id}"
+        url = f"{self.settings.alto_api_base_url}/listing/property/{property_id}"
 
         try:
             headers = await self._get_headers(alto_agency_ref)

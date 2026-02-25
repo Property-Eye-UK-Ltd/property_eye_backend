@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     LAND_REGISTRY_API_KEY: Optional[str] = None
     LAND_REGISTRY_API_URL: str = "https://api.landregistry.gov.uk"
 
+    # HMLR Business Gateway (Online Owner Verification)
+    HMLR_BG_BASE_URL: str = "https://bgtest.landregistry.gov.uk"
+    HMLR_OOV_PATH: str = (
+        "/b2b/EOOV_SoapEngine/OnlineOwnershipVerificationV1_0WebService"
+    )
+    HMLR_BG_USERNAME: str
+    HMLR_BG_PASSWORD: str
+    HMLR_TLS_CERT_PATH: str
+    HMLR_TLS_KEY_PATH: str
+    HMLR_TIMEOUT_SECONDS: int = 20
+
     # Redis Configuration (for future caching)
     REDIS_URL: str = "redis://localhost:6379/0"
 
@@ -78,14 +89,12 @@ class Settings(BaseSettings):
     ALTO_ENV: str = "sandbox"  # "sandbox" or "production"
 
     # Sandbox defaults
-    # ALTO_SANDBOX_AUTH_URL: str = "https://www.zoopla.co.uk/oauth/token"
-    # ALTO_SANDBOX_API_BASE: str = "https://mobile-api.zoopla.co.uk/sandbox/v1"
     ALTO_SANDBOX_AUTH_URL: str = "https://api.alto.zoopladev.co.uk/token"
-    ALTO_SANDBOX_API_BASE: str = "https://mobile-api.zoopla.co.uk"
+    ALTO_SANDBOX_API_BASE: str = "https://api.alto.zoopladev.co.uk"
 
     # Production defaults
-    ALTO_PRODUCTION_AUTH_URL: str = "https://www.zoopla.co.uk/oauth/token"
-    ALTO_PRODUCTION_API_BASE: str = "https://mobile-api.zoopla.co.uk/v1"
+    ALTO_PRODUCTION_AUTH_URL: str = "https://api.alto.zoopla.co.uk/token"
+    ALTO_PRODUCTION_API_BASE: str = "https://api.alto.zoopla.co.uk"
 
     ALTO_CLIENT_ID: str
     ALTO_CLIENT_SECRET: str

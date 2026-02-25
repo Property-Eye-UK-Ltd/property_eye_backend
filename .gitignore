@@ -219,3 +219,5 @@ fraud_detection.db
 fraud_detection.db-journal
 data/ppd/*.parquet
 scripts/__pycache__/
+
+/certs

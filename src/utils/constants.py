@@ -56,6 +56,15 @@ class FraudDetectionConfig:
     LAND_REGISTRY_TIMEOUT: int = 30  # seconds
     LAND_REGISTRY_MAX_RETRIES: int = 3
 
+    # HMLR Business Gateway (Online Owner Verification)
+    HMLR_BG_BASE_URL: str = field(default="https://bgtest.landregistry.gov.uk")
+
+    HMLR_BG_USERNAME: str = field(default="")
+    HMLR_BG_PASSWORD: str = field(default="")
+    HMLR_TLS_CERT_PATH: str = field(default="")
+    HMLR_TLS_KEY_PATH: str = field(default="")
+    HMLR_TIMEOUT_SECONDS: int = 20
+
     # Parquet File Sizing
     TARGET_PARQUET_SIZE_MB: int = 500  # Target 500MB per file (between 100MB-1GB)
 
@@ -80,6 +89,12 @@ def get_config():
         SYNC_PPD=settings.SYNC_PPD,
         LAND_REGISTRY_API_URL=settings.LAND_REGISTRY_API_URL,
         LAND_REGISTRY_API_KEY=settings.LAND_REGISTRY_API_KEY or "",
+        HMLR_BG_BASE_URL=settings.HMLR_BG_BASE_URL,
+        HMLR_BG_USERNAME=settings.HMLR_BG_USERNAME,
+        HMLR_BG_PASSWORD=settings.HMLR_BG_PASSWORD,
+        HMLR_TLS_CERT_PATH=settings.HMLR_TLS_CERT_PATH,
+        HMLR_TLS_KEY_PATH=settings.HMLR_TLS_KEY_PATH,
+        HMLR_TIMEOUT_SECONDS=settings.HMLR_TIMEOUT_SECONDS,
     )
 
 
