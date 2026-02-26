@@ -3,6 +3,7 @@ Property Eye Fraud Detection POC - Main Application Entry Point
 """
 
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -31,8 +32,60 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown lifecycle for the FastAPI app."""
+    # Startup
+    logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
+
+    ppd_volume = Path(config.PPD_VOLUME_PATH)
+    if not ppd_volume.exists():
+        logger.warning(f"PPD volume path does not exist: {ppd_volume}")
+        logger.info(f"Creating PPD volume directory: {ppd_volume}")
+        ppd_volume.mkdir(parents=True, exist_ok=True)
+    else:
+        logger.info(f"PPD volume path verified: {ppd_volume}")
+
+    csv_volume = Path(config.CSV_VOLUME_PATH)
+    if not csv_volume.exists():
+        logger.info(f"Creating CSV volume directory: {csv_volume}")
+        csv_volume.mkdir(parents=True, exist_ok=True)
+    else:
+        logger.info(f"CSV volume path verified: {csv_volume}")
+
+    if config.SYNC_PPD:
+        logger.info("SYNC_PPD enabled - starting automatic PPD ingestion")
+        from src.services.ppd_sync_service import PPDSyncService
+
+        sync_service = PPDSyncService()
+        sync_summary = await sync_service.sync_ppd_data()
+
+        logger.info(
+            f"PPD sync complete: {sync_summary['newly_ingested']} new files ingested, "
+            f"{sync_summary['already_ingested']} already processed, "
+            f"{sync_summary['failed']} failed"
+        )
+
+        if sync_summary["errors"]:
+            for error in sync_summary["errors"]:
+                logger.error(f"  - {error}")
+    else:
+        logger.info("SYNC_PPD disabled - skipping automatic PPD ingestion")
+
+    logger.info("Application startup complete")
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down application")
+    await engine.dispose()
+    logger.info("Application shutdown complete")
+
+
 app = FastAPI(
     title=settings.APP_NAME,
+    lifespan=lifespan,
     description="""
     POC system for detecting property fraud by comparing agency listings against UK Land Registry data.
     
@@ -114,57 +167,3 @@ async def health_check():
     }
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize resources on application startup"""
-    logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
-
-    # Verify PPD volume path exists
-    ppd_volume = Path(config.PPD_VOLUME_PATH)
-    if not ppd_volume.exists():
-        logger.warning(f"PPD volume path does not exist: {ppd_volume}")
-        logger.info(f"Creating PPD volume directory: {ppd_volume}")
-        ppd_volume.mkdir(parents=True, exist_ok=True)
-    else:
-        logger.info(f"PPD volume path verified: {ppd_volume}")
-
-    # Verify CSV volume path exists
-    csv_volume = Path(config.CSV_VOLUME_PATH)
-    if not csv_volume.exists():
-        logger.info(f"Creating CSV volume directory: {csv_volume}")
-        csv_volume.mkdir(parents=True, exist_ok=True)
-    else:
-        logger.info(f"CSV volume path verified: {csv_volume}")
-
-    # Auto-sync PPD data if enabled
-    if config.SYNC_PPD:
-        logger.info("SYNC_PPD enabled - starting automatic PPD ingestion")
-        from src.services.ppd_sync_service import PPDSyncService
-
-        sync_service = PPDSyncService()
-        sync_summary = await sync_service.sync_ppd_data()
-
-        logger.info(
-            f"PPD sync complete: {sync_summary['newly_ingested']} new files ingested, "
-            f"{sync_summary['already_ingested']} already processed, "
-            f"{sync_summary['failed']} failed"
-        )
-
-        if sync_summary["errors"]:
-            for error in sync_summary["errors"]:
-                logger.error(f"  - {error}")
-    else:
-        logger.info("SYNC_PPD disabled - skipping automatic PPD ingestion")
-
-    logger.info("Application startup complete")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up resources on application shutdown"""
-    logger.info("Shutting down application")
-
-    # Close database connection
-    await engine.dispose()
-
-    logger.info("Application shutdown complete")

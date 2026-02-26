@@ -9,6 +9,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.db.session import get_db
 from src.models.fraud_match import FraudMatch
@@ -113,8 +114,12 @@ async def get_verification_status(
     logger.info(f"Retrieving verification status for match {match_id}")
 
     try:
-        # Retrieve match from database
-        stmt = select(FraudMatch).where(FraudMatch.id == match_id)
+        # Retrieve match from database with property_listing eager-loaded for async
+        stmt = (
+            select(FraudMatch)
+            .where(FraudMatch.id == match_id)
+            .options(selectinload(FraudMatch.property_listing))
+        )
         result = await db.execute(stmt)
         fraud_match = result.scalar_one_or_none()
 
@@ -124,7 +129,6 @@ async def get_verification_status(
                 detail=f"Match {match_id} not found",
             )
 
-        # Get property listing details
         property_listing = fraud_match.property_listing
 
         return VerificationResult(

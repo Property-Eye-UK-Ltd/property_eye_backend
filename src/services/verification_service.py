@@ -6,11 +6,12 @@ Processes suspicious matches through Land Registry API to confirm fraud cases.
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.models.fraud_match import FraudMatch
 from src.schemas.verification import VerificationResult, VerificationSummary
@@ -104,8 +105,12 @@ class VerificationService:
         Returns:
             VerificationResult for this match
         """
-        # Retrieve match from database
-        stmt = select(FraudMatch).where(FraudMatch.id == match_id)
+        # Retrieve match from database with property_listing eager-loaded for async
+        stmt = (
+            select(FraudMatch)
+            .where(FraudMatch.id == match_id)
+            .options(selectinload(FraudMatch.property_listing))
+        )
         result = await db.execute(stmt)
         fraud_match = result.scalar_one_or_none()
 
@@ -118,7 +123,7 @@ class VerificationService:
                 verification_status="error",
                 verified_owner_name=None,
                 is_confirmed_fraud=False,
-                verified_at=datetime.utcnow(),
+                verified_at=datetime.now(timezone.utc),
                 error_message="Match not found in database",
             )
 
@@ -137,7 +142,7 @@ class VerificationService:
             fraud_match.land_registry_response = (
                 json.dumps(api_result.raw_response) if api_result.raw_response else None
             )
-            fraud_match.verified_at = datetime.utcnow()
+            fraud_match.verified_at = datetime.now(timezone.utc)
 
             # Check for API errors
             if api_result.verification_status == "error":
@@ -190,7 +195,7 @@ class VerificationService:
 
             fraud_match.verification_status = "error"
             fraud_match.is_confirmed_fraud = False
-            fraud_match.verified_at = datetime.utcnow()
+            fraud_match.verified_at = datetime.now(timezone.utc)
             await db.commit()
 
             return VerificationResult(

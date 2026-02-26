@@ -7,7 +7,7 @@ Defines schemas for Stage 2 verification requests and responses.
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class VerificationRequest(BaseModel):
@@ -17,15 +17,8 @@ class VerificationRequest(BaseModel):
     Accepts a list of match IDs to verify via Land Registry API.
     """
 
-    match_ids: list[str] = Field(
-        ...,
-        description="List of fraud match IDs to verify",
-        min_length=1,
-        example=["770e8400-e29b-41d4-a716-446655440002"],
-    )
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "match_ids": [
                     "770e8400-e29b-41d4-a716-446655440002",
@@ -33,6 +26,13 @@ class VerificationRequest(BaseModel):
                 ]
             }
         }
+    )
+
+    match_ids: list[str] = Field(
+        ...,
+        description="List of fraud match IDs to verify",
+        min_length=1,
+    )
 
 
 class VerificationResult(BaseModel):
@@ -58,8 +58,8 @@ class VerificationResult(BaseModel):
         None, description="Error message if verification failed"
     )
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "match_id": "770e8400-e29b-41d4-a716-446655440002",
                 "property_address": "123 High Street, London",
@@ -71,6 +71,7 @@ class VerificationResult(BaseModel):
                 "error_message": None,
             }
         }
+    )
 
 
 class VerificationSummary(BaseModel):
@@ -93,8 +94,8 @@ class VerificationSummary(BaseModel):
     )
     message: str = Field(..., description="Summary message for verification results")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "total_verified": 12,
                 "confirmed_fraud_count": 8,
@@ -104,3 +105,4 @@ class VerificationSummary(BaseModel):
                 "message": "Stage 2 complete: 8 confirmed fraud cases, 3 ruled out, 1 error",
             }
         }
+    )
