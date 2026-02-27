@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     HMLR_BG_PASSWORD: str
     HMLR_TLS_CERT_PATH: str
     HMLR_TLS_KEY_PATH: str
+    # Optional custom CA bundle for BG test / production (PEM file)
+    HMLR_CA_BUNDLE_PATH: Optional[str] = None
     HMLR_TIMEOUT_SECONDS: int = 20
 
     # Redis Configuration (for future caching)

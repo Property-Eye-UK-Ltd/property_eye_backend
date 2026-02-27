@@ -8,7 +8,7 @@ and confidence score distributions.
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class FraudMatchSchema(BaseModel):
@@ -17,6 +17,31 @@ class FraudMatchSchema(BaseModel):
 
     Represents a potential or confirmed fraud case with all relevant details.
     """
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "id": "770e8400-e29b-41d4-a716-446655440002",
+                "property_listing_id": "880e8400-e29b-41d4-a716-446655440003",
+                "property_address": "123 High Street, London",
+                "client_name": "John Smith",
+                "withdrawn_date": "2025-01-15T00:00:00",
+                "ppd_transaction_id": "{ABC123-DEF456}",
+                "ppd_price": 450000,
+                "ppd_transfer_date": "2025-02-20T00:00:00",
+                "ppd_postcode": "SW1A 1AA",
+                "ppd_full_address": "123 HIGH STREET, LONDON, SW1A 1AA",
+                "confidence_score": 87.5,
+                "address_similarity": 92.0,
+                "verification_status": "suspicious",
+                "verified_owner_name": None,
+                "is_confirmed_fraud": False,
+                "detected_at": "2025-03-01T10:30:00",
+                "verified_at": None,
+            }
+        },
+    )
 
     id: str = Field(..., description="Unique match identifier")
     property_listing_id: str = Field(..., description="Property listing ID")
@@ -58,30 +83,6 @@ class FraudMatchSchema(BaseModel):
     detected_at: datetime = Field(..., description="When match was detected")
     verified_at: Optional[datetime] = Field(None, description="When match was verified")
 
-    class Config:
-        from_attributes = True
-        json_schema_extra = {
-            "example": {
-                "id": "770e8400-e29b-41d4-a716-446655440002",
-                "property_listing_id": "880e8400-e29b-41d4-a716-446655440003",
-                "property_address": "123 High Street, London",
-                "client_name": "John Smith",
-                "withdrawn_date": "2025-01-15T00:00:00",
-                "ppd_transaction_id": "{ABC123-DEF456}",
-                "ppd_price": 450000,
-                "ppd_transfer_date": "2025-02-20T00:00:00",
-                "ppd_postcode": "SW1A 1AA",
-                "ppd_full_address": "123 HIGH STREET, LONDON, SW1A 1AA",
-                "confidence_score": 87.5,
-                "address_similarity": 92.0,
-                "verification_status": "suspicious",
-                "verified_owner_name": None,
-                "is_confirmed_fraud": False,
-                "detected_at": "2025-03-01T10:30:00",
-                "verified_at": None,
-            }
-        }
-
 
 class ConfidenceDistribution(BaseModel):
     """
@@ -90,20 +91,21 @@ class ConfidenceDistribution(BaseModel):
     Helps agencies prioritize which matches to verify first.
     """
 
-    high_confidence: int = Field(
-        ..., description="Matches with confidence >= 85% (recommended for verification)"
-    )
-    medium_confidence: int = Field(..., description="Matches with confidence 70-84%")
-    low_confidence: int = Field(..., description="Matches with confidence < 70%")
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "high_confidence": 12,
                 "medium_confidence": 28,
                 "low_confidence": 5,
             }
         }
+    )
+
+    high_confidence: int = Field(
+        ..., description="Matches with confidence >= 85% (recommended for verification)"
+    )
+    medium_confidence: int = Field(..., description="Matches with confidence 70-84%")
+    low_confidence: int = Field(..., description="Matches with confidence < 70%")
 
 
 class SuspiciousMatchSummary(BaseModel):
@@ -114,19 +116,8 @@ class SuspiciousMatchSummary(BaseModel):
     before any Land Registry verification calls are made.
     """
 
-    total_matches: int = Field(
-        ..., description="Total number of suspicious matches detected"
-    )
-    confidence_distribution: ConfidenceDistribution = Field(
-        ..., description="Distribution of matches by confidence score"
-    )
-    matches: list[FraudMatchSchema] = Field(
-        ..., description="List of all suspicious matches"
-    )
-    message: str = Field(..., description="Summary message for the detection results")
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "total_matches": 45,
                 "confidence_distribution": {
@@ -138,3 +129,15 @@ class SuspiciousMatchSummary(BaseModel):
                 "message": "Stage 1 complete: 45 suspicious matches detected. Review high-confidence matches for Land Registry verification.",
             }
         }
+    )
+
+    total_matches: int = Field(
+        ..., description="Total number of suspicious matches detected"
+    )
+    confidence_distribution: ConfidenceDistribution = Field(
+        ..., description="Distribution of matches by confidence score"
+    )
+    matches: list[FraudMatchSchema] = Field(
+        ..., description="List of all suspicious matches"
+    )
+    message: str = Field(..., description="Summary message for the detection results")

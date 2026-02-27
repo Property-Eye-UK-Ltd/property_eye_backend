@@ -20,6 +20,7 @@ class FakeLandRegistryClientSuccess:
         property_address: str,
         postcode: str,
         expected_owner_name: str,
+        message_id: str = None,
     ) -> OwnershipVerificationResult:
         """Return a successful ownership verification result."""
         return OwnershipVerificationResult(
@@ -38,6 +39,7 @@ class FakeLandRegistryClientMismatch:
         property_address: str,
         postcode: str,
         expected_owner_name: str,
+        message_id: str = None,
     ) -> OwnershipVerificationResult:
         """Return a successful response with a mismatching owner name."""
         return OwnershipVerificationResult(
@@ -56,6 +58,7 @@ class FakeLandRegistryClientError:
         property_address: str,
         postcode: str,
         expected_owner_name: str,
+        message_id: str = None,
     ) -> OwnershipVerificationResult:
         """Return an error verification result."""
         return OwnershipVerificationResult(
@@ -74,6 +77,7 @@ class FakeLandRegistryClientException:
         property_address: str,
         postcode: str,
         expected_owner_name: str,
+        message_id: str = None,
     ) -> OwnershipVerificationResult:  # type: ignore[override]
         """Raise a runtime error to simulate unexpected failure."""
         raise RuntimeError("Simulated unexpected failure")
@@ -309,6 +313,7 @@ async def test_verify_suspicious_matches_summary_counts(db_session: AsyncSession
             property_address: str,
             postcode: str,
             expected_owner_name: str,
+            message_id: str = None,
         ) -> OwnershipVerificationResult:
             """Return different results depending on the supplied postcode."""
             if postcode == "PC-CONFIRMED":

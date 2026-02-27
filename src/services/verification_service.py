@@ -136,6 +136,7 @@ class VerificationService:
                 property_address=fraud_match.ppd_full_address,
                 postcode=fraud_match.ppd_postcode,
                 expected_owner_name=property_listing.client_name,
+                message_id=fraud_match.ppd_transaction_id,
             )
 
             # Store API response
@@ -144,7 +145,7 @@ class VerificationService:
             )
             fraud_match.verified_at = datetime.now(timezone.utc)
 
-            # Check for API errors
+            # API/infrastructure failure — could not complete verification.
             if api_result.verification_status == "error":
                 fraud_match.verification_status = "error"
                 fraud_match.is_confirmed_fraud = False
@@ -161,7 +162,26 @@ class VerificationService:
                     error_message=api_result.error_message,
                 )
 
-            # Compare owner names
+            # HMLR verified the property but the owner name did not match —
+            # the client is confirmed NOT to be the registered owner.
+            if api_result.verification_status == "not_fraud":
+                fraud_match.verification_status = "not_fraud"
+                fraud_match.is_confirmed_fraud = False
+                await db.commit()
+                logger.info(f"Match {match_id} ruled out as fraud (name mismatch from HMLR)")
+
+                return VerificationResult(
+                    match_id=match_id,
+                    property_address=property_listing.address,
+                    client_name=property_listing.client_name,
+                    verification_status="not_fraud",
+                    verified_owner_name=None,
+                    is_confirmed_fraud=False,
+                    verified_at=fraud_match.verified_at,
+                    error_message=None,
+                )
+
+            # HMLR returned a name match — do a fuzzy compare as a second gate.
             fraud_match.verified_owner_name = api_result.owner_name
 
             is_match = self._compare_owner_names(

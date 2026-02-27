@@ -7,6 +7,7 @@ for the rest of the application.
 """
 
 import logging
+import ssl
 import uuid
 from typing import Optional
 from xml.sax.saxutils import escape as xml_escape
@@ -60,24 +61,38 @@ class LandRegistryClient:
         self._username = config.HMLR_BG_USERNAME
         self._password = config.HMLR_BG_PASSWORD
         self._timeout = config.HMLR_TIMEOUT_SECONDS
-        self._cert = (config.HMLR_TLS_CERT_PATH, config.HMLR_TLS_KEY_PATH)
+        self._cert_path = config.HMLR_TLS_CERT_PATH
+        self._key_path = config.HMLR_TLS_KEY_PATH
+        self._ca_bundle_path = config.HMLR_CA_BUNDLE_PATH or None
 
-        # The OOV SOAP path is fixed for this integration; do not rely on env.
+        # OOV endpoint differs between test and production:
+        #   test:       /b2b/EOOV_StubService/OnlineOwnershipVerificationV1_0WebService
+        #   production: /b2b/EOOV_SoapEngine/OnlineOwnershipVerificationV1_0WebService
+        is_test = "bgtest" in base_url
+        stub_or_engine = "EOOV_StubService" if is_test else "EOOV_SoapEngine"
         self._oov_path = (
-            "/b2b/EOOV_SoapEngine/OnlineOwnershipVerificationV1_0WebService"
+            f"/b2b/{stub_or_engine}/OnlineOwnershipVerificationV1_0WebService"
         )
-        print("cert", self._cert)
 
-        # attempt to log out parts of the cert to verify correct file path
-        with open(self._cert[0], "r") as f:
-            print("cert 0", f.read())
-        with open(self._cert[1], "r") as f:
-            print("cert 1", f.read())
+        # Build an explicit SSL context for mutual TLS and CA verification.
+        # HMLR_CA_BUNDLE_PATH must be set — system CAs do not include the HMLR
+        # root CA, so omitting it will always produce CERTIFICATE_VERIFY_FAILED.
+        if not self._ca_bundle_path:
+            raise RuntimeError(
+                "HMLR_CA_BUNDLE_PATH is not configured. "
+                "Mutual TLS to the HMLR Business Gateway requires the HMLR CA bundle. "
+                "Set HMLR_CA_BUNDLE_PATH in your .env to the path of hmlr-ca-bundle.pem."
+            )
+
+        ssl_context = ssl.create_default_context(cafile=self._ca_bundle_path)
+        ssl_context.load_cert_chain(
+            certfile=self._cert_path,
+            keyfile=self._key_path,
+        )
 
         self.client = httpx.AsyncClient(
             base_url=base_url,
-            cert=self._cert,
-            verify=True,
+            verify=ssl_context,
             timeout=self._timeout,
         )
 
@@ -93,9 +108,8 @@ class LandRegistryClient:
         try:
             response = await self.client.post(
                 self._oov_path,
-                content=soap_body,
+                content=soap_body.encode("utf-8"),
                 headers={"Content-Type": "text/xml; charset=utf-8"},
-                auth=(self._username, self._password),
             )
         except httpx.TimeoutException as exc:
             logger.error("Timeout calling HMLR OOV service: %s", exc)
@@ -127,6 +141,7 @@ class LandRegistryClient:
         property_address: str,
         postcode: str,
         expected_owner_name: str,
+        message_id: Optional[str] = None,
     ) -> OwnershipVerificationResult:
         """
         High-level ownership verification using OOV behind the scenes.
@@ -150,8 +165,19 @@ class LandRegistryClient:
             postcode=postcode or None,
         )
 
+        if message_id:
+            # Sanitise: MessageId must be 5-50 chars, pattern [a-zA-Z0-9][a-zA-Z0-9\-]*
+            import re
+            safe_id = re.sub(r"[^a-zA-Z0-9\-]", "-", message_id)[:50]
+            if not safe_id[0].isalnum():
+                safe_id = "PE-" + safe_id
+            ref = safe_id if len(safe_id) >= 5 else f"PE-{safe_id}"
+        else:
+            short_id = str(uuid.uuid4()).replace("-", "")[:20]
+            ref = f"PE-{short_id}"
+
         oov_request = OovRequest(
-            external_reference=f"property-eye-{uuid.uuid4()}",
+            external_reference=ref,
             customer_reference=None,
             person_name=(
                 None
@@ -181,12 +207,24 @@ class LandRegistryClient:
                 raw_response=None,
             )
 
-        # Interpret OOV response in simple ok/error terms for existing flows.
-        if (
+        # True API/infrastructure failures: rejection, timeout, parse error, etc.
+        # These are codes where we couldn't complete verification at all.
+        # bg.match.found and bg.novalidmatch both indicate the API worked — just
+        # different name-match outcomes — so they fall through to the match logic.
+        _non_match_error_codes = {
+            "bg.soap.fault",
+            "bg.timeout",
+            "bg.request.error",
+            "bg.parse.error",
+            "bg.response.missing",
+            "bg.unknown",
+        }
+        if oov_response.status_code in _non_match_error_codes or (
             oov_response.status_code.startswith("bg.")
-            and "match" not in oov_response.status_code
+            and oov_response.status_code not in {"bg.match.found", "bg.novalidmatch"}
+            and "rejection" not in oov_response.status_code
+            and oov_response.status_code not in {"bg.properties.nopropertyfound"}
         ):
-            # Treat explicit Business Gateway error/rejection codes as error.
             return OwnershipVerificationResult(
                 owner_name=None,
                 verification_status="error",
@@ -194,13 +232,30 @@ class LandRegistryClient:
                 raw_response=oov_response.model_dump(),
             )
 
-        any_match = any(t.owners for t in oov_response.matches)
+        # TypeCode 20 rejections: HMLR explicitly could not find the property.
+        # This is a legitimate "cannot verify" result — treat as error, not not_fraud.
+        if oov_response.status_code.startswith("bg.properties.") or (
+            oov_response.status_code == "bg.rejection"
+        ):
+            return OwnershipVerificationResult(
+                owner_name=None,
+                verification_status="error",
+                error_message=oov_response.status_message,
+                raw_response=oov_response.model_dump(),
+            )
+
+        # TypeCode 30: API completed successfully. Determine match outcome.
+        any_match = any(
+            o.is_current_owner or o.is_historical_owner
+            for t in oov_response.matches
+            for o in t.owners
+        )
         owner_name = expected_owner_name if any_match else None
 
         return OwnershipVerificationResult(
             owner_name=owner_name,
-            verification_status="ok" if any_match else "error",
-            error_message=None if any_match else oov_response.status_message,
+            verification_status="ok" if any_match else "not_fraud",
+            error_message=None,
             raw_response=oov_response.model_dump(),
         )
 
@@ -209,123 +264,138 @@ class LandRegistryClient:
         await self.client.aclose()
 
     def _build_oov_request_xml(self, request: OovRequest) -> str:
-        """Build SOAP envelope for RequestOnlineOwnershipVerificationV1_0."""
-        message_id = f"PropertyEye-OOV-{uuid.uuid4()}"
+        """Build SOAP envelope for RequestOnlineOwnershipVerificationV1_0.
 
+        Authentication is via WS-Security UsernameToken in the SOAP header —
+        not HTTP Basic auth. Credentials and locale are mandatory per the BG
+        developer guide (section 4.3).
+
+        Element ordering inside RequestOOV must follow the XSD sequence:
+        MessageId → Reference → SubjectProperty → FirstForename → [MiddleName]
+        → Surname → Indicators.
+        """
+        message_id = xml_escape(request.external_reference)
         reference = xml_escape(request.external_reference)
 
-        # SubjectProperty: title number or property address (title preferred when present).
+        # WS-Security UsernameToken header (mandatory for all BG services).
+        wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+        pw_type = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
+        wsse_header = (
+            f'<wsse:Security xmlns:wsse="{wsse_ns}">'
+            f"<wsse:UsernameToken>"
+            f"<wsse:Username>{xml_escape(self._username)}</wsse:Username>"
+            f'<wsse:Password type="{pw_type}">{xml_escape(self._password)}</wsse:Password>'
+            f"</wsse:UsernameToken>"
+            f"</wsse:Security>"
+            f'<i18n:international xmlns:i18n="http://www.w3.org/2005/09/ws-i18n">'
+            f"<i18n:locale>en</i18n:locale>"
+            f"</i18n:international>"
+        )
+
+        # SubjectProperty: title number or property address (title preferred).
         if request.title_number:
             subject_xml = (
-                f"<oov:SubjectProperty>"
-                f"<oov:TitleNumber>{xml_escape(request.title_number)}</oov:TitleNumber>"
-                f"</oov:SubjectProperty>"
+                "<req:SubjectProperty>"
+                f"<req:TitleNumber>{xml_escape(request.title_number)}</req:TitleNumber>"
+                "</req:SubjectProperty>"
             )
         elif request.address:
             addr = request.address
-            building_xml = f"<oov:BuildingNumber>{xml_escape(addr.building_name_or_number)}</oov:BuildingNumber>"
+            # BuildingNumber vs BuildingName: use BuildingNumber for numeric-
+            # looking values, BuildingName otherwise.
+            building_val = addr.building_name_or_number or ""
+            if building_val.split()[0].rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ").isdigit():
+                building_xml = f"<req:BuildingNumber>{xml_escape(building_val[:5])}</req:BuildingNumber>"
+            else:
+                building_xml = f"<req:BuildingName>{xml_escape(building_val[:50])}</req:BuildingName>"
             street_xml = (
-                f"<oov:StreetName>{xml_escape(addr.street)}</oov:StreetName>"
+                f"<req:StreetName>{xml_escape(addr.street[:80])}</req:StreetName>"
                 if addr.street
                 else ""
             )
             city_xml = (
-                f"<oov:CityName>{xml_escape(addr.town)}</oov:CityName>"
+                f"<req:CityName>{xml_escape(addr.town[:35])}</req:CityName>"
                 if addr.town
                 else ""
             )
             postcode_xml = (
-                f"<oov:PostcodeZone>{xml_escape(addr.postcode)}</oov:PostcodeZone>"
+                f"<req:PostcodeZone>{xml_escape(addr.postcode[:8])}</req:PostcodeZone>"
                 if addr.postcode
                 else ""
             )
             subject_xml = (
-                "<oov:SubjectProperty>"
-                "<oov:PropertyAddress>"
+                "<req:SubjectProperty>"
+                "<req:PropertyAddress>"
                 f"{building_xml}{street_xml}{city_xml}{postcode_xml}"
-                "</oov:PropertyAddress>"
-                "</oov:SubjectProperty>"
+                "</req:PropertyAddress>"
+                "</req:SubjectProperty>"
             )
         else:
             raise ValueError("OOV request must include either address or title_number.")
 
-        # Name or company – OOV requires FirstForename and Surname for individuals.
-        person_name_xml = ""
+        # FirstForename and Surname are direct children of RequestOOV (not
+        # wrapped in a PersonName element). Both are mandatory per the XSD.
+        forename_xml = ""
+        surname_xml = ""
+        middle_xml = ""
         if request.person_name:
-            first = request.person_name.forename or ""
-            middle = ""
-            surname = request.person_name.surname or ""
-            if request.person_name.title:
-                # Title is not part of the schema; we ignore it at XML level.
-                logger.debug("Ignoring person title in OOV request XML.")
-
+            first = (request.person_name.forename or "").strip()
+            surname = (request.person_name.surname or "").strip()
             if not first or not surname:
-                logger.debug(
-                    "Partial person name supplied; OOV may reject this request."
-                )
+                logger.debug("Partial person name supplied; OOV may reject this request.")
+            forename_xml = f"<req:FirstForename>{xml_escape(first)}</req:FirstForename>"
+            surname_xml = f"<req:Surname>{xml_escape(surname)}</req:Surname>"
 
-            first_xml = f"<oov:FirstForename>{xml_escape(first)}</oov:FirstForename>"
-            surname_xml = f"<oov:Surname>{xml_escape(surname)}</oov:Surname>"
-            middle_xml = ""
-            if middle:
-                middle_xml = (
-                    "<oov:MiddleName>"
-                    f"<oov:MiddleName>{xml_escape(middle)}</oov:MiddleName>"
-                    "</oov:MiddleName>"
-                )
-
-            person_name_xml = f"{first_xml}{middle_xml}{surname_xml}"
-
-        # Indicators – map our booleans onto SkipPartialMatching / SkipHistoricalMatching.
-        indicators: list[str] = []
-
-        # ContinueIfOutOfHours -> always true so that queued requests get processed.
-        indicators.append(
-            "<oov:Indicator>"
-            "<oov:IndicatorType>ContinueIfOutOfHours</oov:IndicatorType>"
-            "<oov:IndicatorValue>true</oov:IndicatorValue>"
-            "</oov:Indicator>"
-        )
-
+        # Indicators.
         skip_partial = not request.partial_match
-        indicators.append(
-            "<oov:Indicator>"
-            "<oov:IndicatorType>SkipPartialMatching</oov:IndicatorType>"
-            f"<oov:IndicatorValue>{'true' if skip_partial else 'false'}</oov:IndicatorValue>"
-            "</oov:Indicator>"
-        )
-
         skip_historical = not request.historical_match
-        indicators.append(
-            "<oov:Indicator>"
-            "<oov:IndicatorType>SkipHistoricalMatching</oov:IndicatorType>"
-            f"<oov:IndicatorValue>{'true' if skip_historical else 'false'}</oov:IndicatorValue>"
-            "</oov:Indicator>"
+        indicators_xml = (
+            "<req:Indicators>"
+            "<req:Indicator>"
+            "<req:IndicatorType>ContinueIfOutOfHours</req:IndicatorType>"
+            "<req:IndicatorValue>true</req:IndicatorValue>"
+            "</req:Indicator>"
+            "<req:Indicator>"
+            "<req:IndicatorType>SkipPartialMatching</req:IndicatorType>"
+            f"<req:IndicatorValue>{'true' if skip_partial else 'false'}</req:IndicatorValue>"
+            "</req:Indicator>"
+            "<req:Indicator>"
+            "<req:IndicatorType>SkipHistoricalMatching</req:IndicatorType>"
+            f"<req:IndicatorValue>{'true' if skip_historical else 'false'}</req:IndicatorValue>"
+            "</req:Indicator>"
+            "</req:Indicators>"
         )
 
-        indicators_xml = "<oov:Indicators>" + "".join(indicators) + "</oov:Indicators>"
+        # WSDL operation: tns:verifyOwnership / <in> (no namespace) containing
+        # the RequestOOV fields directly in the req namespace.
+        # tns = http://ownershipv1_0.ws.bg.lr.gov/
+        # req = http://www.landregistry.gov.uk/OOV/RequestOnlineOwnershipVerificationV1_0
+        req_ns = "http://www.landregistry.gov.uk/OOV/RequestOnlineOwnershipVerificationV1_0"
+        tns_ns = "http://ownershipv1_0.ws.bg.lr.gov/"
 
-        request_oov_xml = (
-            "<oov:RequestOOV>"
-            f"<oov:MessageId>{xml_escape(message_id)}</oov:MessageId>"
-            f"<oov:Reference>{reference}</oov:Reference>"
+        body_inner = (
+            f"<req:MessageId>{xml_escape(message_id)}</req:MessageId>"
+            f"<req:Reference>{reference}</req:Reference>"
             f"{subject_xml}"
-            f"{person_name_xml}"
+            f"{forename_xml}"
+            f"{middle_xml}"
+            f"{surname_xml}"
             f"{indicators_xml}"
-            "</oov:RequestOOV>"
         )
 
-        envelope = (
-            '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
-            'xmlns:oov="http://www.landregistry.gov.uk/OOV/RequestOnlineOwnershipVerificationV1_0">'
-            "<soapenv:Header/>"
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+            f' xmlns:req="{req_ns}"'
+            f' xmlns:tns="{tns_ns}">'
+            f"<soapenv:Header>{wsse_header}</soapenv:Header>"
             "<soapenv:Body>"
-            f"{request_oov_xml}"
+            "<tns:verifyOwnership>"
+            f"<in>{body_inner}</in>"
+            "</tns:verifyOwnership>"
             "</soapenv:Body>"
             "</soapenv:Envelope>"
         )
-
-        return envelope
 
     def _parse_oov_response(
         self,
@@ -337,7 +407,13 @@ class LandRegistryClient:
         raw_status = response.status_code
 
         try:
-            parsed = xmltodict.parse(raw_body)
+            # strip_whitespace + process_namespaces collapses ns prefixes to
+            # bare local names, which makes downstream key lookups namespace-agnostic.
+            parsed = xmltodict.parse(raw_body, process_namespaces=True, namespaces={
+                "http://schemas.xmlsoap.org/soap/envelope/": "soapenv",
+                "http://ownershipv1_0.ws.bg.lr.gov/": "tns",
+                "http://www.landregistry.gov.uk/OOV/ResponseOnlineOwnershipVerificationV1_0": None,
+            })
         except Exception as exc:
             logger.error("Failed to parse OOV XML response: %s", exc)
             return OovResponse(
@@ -349,39 +425,65 @@ class LandRegistryClient:
                 raw_body=raw_body,
             )
 
-        # Drill down to ResponseOOV element, handling potential SOAP wrappers.
-        body = parsed
-        for key in list(parsed.keys()):
-            lowered = key.lower()
-            if "envelope" in lowered:
-                body = parsed[key]
-                break
+        # Drill down through the SOAP envelope to the response payload.
+        # After namespace processing the structure is:
+        #   soapenv:Envelope > soapenv:Body > tns:verifyOwnershipResponse > return > {TypeCode, ...}
+        def _find_key(d: dict, substring: str) -> Optional[dict]:
+            """Return the first value whose key contains substring (case-insensitive)."""
+            for k, v in d.items():
+                if substring in k.lower() and isinstance(v, dict):
+                    return v
+            return None
 
-        for key in list(body.keys()):
-            lowered = key.lower()
-            if "body" in lowered:
-                body = body[key]
-                break
+        body = _find_key(parsed, "envelope") or parsed
+        body = _find_key(body, "body") or body
 
-        response_oov = None
-        for key, value in body.items():
-            if "responseoov" in key.lower():
-                response_oov = value
-                break
+        # Check for SOAP Fault before looking for the success response.
+        # The BG gateway returns a Fault for schema validation errors (e.g. invalid postcode).
+        soap_fault = _find_key(body, "fault")
+        if soap_fault:
+            fault_string = soap_fault.get("faultstring", "SOAP Fault")
+            detail = soap_fault.get("detail") or {}
+            # Collect all SchemaException messages from detail.
+            schema_exc = detail.get("SchemaException") or detail.get("oov:SchemaException")
+            if isinstance(schema_exc, list):
+                schema_msg = "; ".join(str(e) for e in schema_exc)
+            elif schema_exc:
+                schema_msg = str(schema_exc)
+            else:
+                schema_msg = str(detail) if detail else fault_string
+            logger.error("SOAP Fault from HMLR OOV: %s — %s", fault_string, schema_msg)
+            return OovResponse(
+                external_reference=fallback_reference or "",
+                status_code="bg.soap.fault",
+                status_message=schema_msg,
+                matches=[],
+                raw_status_code=raw_status,
+                raw_body=raw_body,
+            )
 
+        # Unwrap the verifyOwnershipResponse / getResponseResponse operation wrapper.
+        body = _find_key(body, "response") or body
+
+        # Unwrap <return> element (holds TypeCode + Result/Rejection/Acknowledgement).
+        response_oov: Optional[dict] = body.get("return") or _find_key(body, "return")
         if response_oov is None:
-            # Handle bare ResponseOOV with no SOAP wrapper.
-            for key, value in parsed.items():
-                if "responseoov" in key.lower():
-                    response_oov = value
-                    break
+            response_oov = body
 
-        if response_oov is None:
-            logger.error("Could not locate ResponseOOV element in OOV response.")
+        # Log the raw parsed payload so tests can see exactly what HMLR returned.
+        import json as _json
+        logger.info(
+            "HMLR OOV raw response payload:\n%s",
+            _json.dumps(response_oov, indent=2, default=str),
+        )
+
+        # Validate we reached the TypeCode level.
+        if not isinstance(response_oov, dict) or "TypeCode" not in response_oov:
+            logger.error("Could not locate ResponseOOV payload in OOV response.")
             return OovResponse(
                 external_reference=fallback_reference or "",
                 status_code="bg.response.missing",
-                status_message="Could not locate ResponseOOV element in response.",
+                status_message="Could not locate ResponseOOV payload in response.",
                 matches=[],
                 raw_status_code=raw_status,
                 raw_body=raw_body,
@@ -442,7 +544,24 @@ class LandRegistryClient:
                 owners: list[OovOwner] = []
 
                 surname_match = m.get("SurnameMatch", {}) or {}
-                surname_type = surname_match.get("TypeOfMatch", "")
+                surname_type = str(surname_match.get("TypeOfMatch", "")).strip()
+
+                forename_match = m.get("ForenameMatchDetails", {}) or {}
+                forename_type = str(forename_match.get("TypeOfMatch", "")).strip()
+
+                string_match = m.get("StringMatchDetails", {}) or {}
+                string_type = str(string_match.get("TypeOfMatch", "")).strip()
+
+                # Determine whether HMLR considers the name a match.
+                # A name is matched when either:
+                #   (a) Surname is MATCH or PARTIAL_MATCH (and forename is not NO_MATCH), or
+                #   (b) Surname is NO_MATCH but StringMatch is MATCH (full-name string match).
+                POSITIVE = {"MATCH", "PARTIAL_MATCH"}
+                name_is_match = (
+                    surname_type in POSITIVE and forename_type not in {"NO_MATCH"}
+                ) or (
+                    surname_type == "NO_MATCH" and string_type == "MATCH"
+                )
 
                 match_infos = m.get("MatchInformation") or []
                 if isinstance(match_infos, dict):
@@ -459,12 +578,12 @@ class LandRegistryClient:
 
                 owners.append(
                     OovOwner(
-                        name_match_type=str(surname_type),
+                        name_match_type=f"surname:{surname_type} forename:{forename_type}",
                         forename=None,
                         surname=None,
                         company_name=None,
-                        is_current_owner=not is_historical,
-                        is_historical_owner=is_historical,
+                        is_current_owner=not is_historical and name_is_match,
+                        is_historical_owner=is_historical and name_is_match,
                     )
                 )
 

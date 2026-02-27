@@ -63,6 +63,7 @@ class FraudDetectionConfig:
     HMLR_BG_PASSWORD: str = field(default="")
     HMLR_TLS_CERT_PATH: str = field(default="")
     HMLR_TLS_KEY_PATH: str = field(default="")
+    HMLR_CA_BUNDLE_PATH: str = field(default="")
     HMLR_TIMEOUT_SECONDS: int = 20
 
     # Parquet File Sizing
@@ -94,6 +95,7 @@ def get_config():
         HMLR_BG_PASSWORD=settings.HMLR_BG_PASSWORD,
         HMLR_TLS_CERT_PATH=settings.HMLR_TLS_CERT_PATH,
         HMLR_TLS_KEY_PATH=settings.HMLR_TLS_KEY_PATH,
+        HMLR_CA_BUNDLE_PATH=settings.HMLR_CA_BUNDLE_PATH or "",
         HMLR_TIMEOUT_SECONDS=settings.HMLR_TIMEOUT_SECONDS,
     )
 

@@ -6,7 +6,7 @@ Defines the structure for mapping agency document columns to system fields.
 
 from typing import Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class FieldMappingSchema(BaseModel):
@@ -25,20 +25,8 @@ class FieldMappingSchema(BaseModel):
         }
     """
 
-    mapping: Dict[str, str] = Field(
-        ...,
-        description="Dictionary mapping agency column names to system field names",
-        example={
-            "Property Address": "address",
-            "Client Full Name": "client_name",
-            "Status": "status",
-            "Date Withdrawn": "withdrawn_date",
-            "Postcode": "postcode",
-        },
-    )
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "mapping": {
                     "Property Address": "address",
@@ -49,3 +37,9 @@ class FieldMappingSchema(BaseModel):
                 }
             }
         }
+    )
+
+    mapping: Dict[str, str] = Field(
+        ...,
+        description="Dictionary mapping agency column names to system field names",
+    )

@@ -19,78 +19,90 @@ from src.models.fraud_match import FraudMatch
 from src.models.property_listing import PropertyListing
 
 
+# ppd_transaction_id is used as the OOV MessageId. The BG test stub only
+# returns canned responses for specific MessageId values (the stub scenario keys).
+# All 9 keys below trigger a TypeCode=30 Result response from the stub.
 PPD_TEST_RECORDS = [
     {
+        "stub_key": "eoov-fm-1",    # full match: surname+forename+middle MATCH, current owner
         "price": 451225,
         "day": 31,
         "month": 7,
         "year": 2025,
-        "postcode": "N15 4AB",
-        "address": "288 PHILIP LANE, LONDON N15 4AB",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
     {
+        "stub_key": "eoov-snm-1",   # surname MATCH, forename NO_MATCH
         "price": 485000,
         "day": 20,
         "month": 1,
         "year": 2025,
-        "postcode": "N4 4NR",
-        "address": "FLAT 19 CONNAUGHT LODGE, CONNAUGHT ROAD, LONDON N4 4NR",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
     {
+        "stub_key": "eoov-snpm-1",  # surname PARTIAL_MATCH, forename NO_MATCH
         "price": 380000,
         "day": 20,
         "month": 3,
         "year": 2025,
-        "postcode": "N21 3AN",
-        "address": "41A FERNLEIGH ROAD, LONDON N21 3AN",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
     {
+        "stub_key": "eoov-fnpm-1",  # surname MATCH, forename PARTIAL_MATCH
         "price": 730000,
         "day": 27,
         "month": 3,
         "year": 2025,
-        "postcode": "EN5 3LT",
-        "address": "3 HAYDEN CLOSE, BARNET EN5 3LT",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
     {
+        "stub_key": "eoov-mnm-1",   # surname+forename MATCH, middle NO_MATCH, historical
         "price": 325000,
         "day": 28,
         "month": 3,
         "year": 2025,
-        "postcode": "EN5 1HY",
-        "address": "2 LANDER COURT, 48 LYONSDOWN ROAD, NEW BARNET EN5 1HY",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
     {
+        "stub_key": "eoov-nsm-1",   # surname NO_MATCH, string MATCH
         "price": 250000,
         "day": 14,
         "month": 3,
         "year": 2025,
-        "postcode": "UB7 7PQ",
-        "address": "FLAT 6 BROOKLYN HOUSE, 22 THE GREEN, WEST DRAYTON UB7 7PQ",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
     {
+        "stub_key": "eoov-nm-1",    # surname NO_MATCH, string NO_MATCH -> no_fraud
         "price": 925000,
         "day": 28,
         "month": 7,
         "year": 2025,
-        "postcode": "NW6 7TU",
-        "address": "22A WINCHESTER AVENUE, LONDON NW6 7TU",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
     {
+        "stub_key": "eoov-hm-1",    # surname+forename+middle MATCH, historical owner
         "price": 600100,
         "day": 21,
         "month": 3,
         "year": 2025,
-        "postcode": "E17 9LS",
-        "address": "27 ADDISON ROAD, LONDON E17 9LS",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
     {
+        "stub_key": "eoov-nam-1",   # rejection: bg.properties.nopropertyfound
         "price": 470000,
         "day": 11,
         "month": 3,
         "year": 2025,
-        "postcode": "EN2 8QJ",
-        "address": "FLAT 14 OAKINGTON COURT, 38 THE RIDGEWAY, ENFIELD EN2 8QJ",
+        "postcode": "PL1 1QQ",
+        "address": "24 DOVEDALE ROAD PLYMOUTH",
     },
 ]
 
@@ -119,7 +131,7 @@ async def test_stage2_verification_real_land_registry(
 
         fraud_match = FraudMatch(
             property_listing_id=listing.id,
-            ppd_transaction_id=f"ppd-{idx}",
+            ppd_transaction_id=rec["stub_key"],
             ppd_price=rec["price"],
             ppd_transfer_date=datetime(
                 rec["year"], rec["month"], rec["day"], tzinfo=timezone.utc
@@ -185,7 +197,7 @@ async def test_verify_matches_endpoint_with_real_land_registry_client(
         agency_id="agency-api-1",
         address="200 API Road",
         normalized_address="200 API ROAD",
-        postcode="AP1 1PI",
+        postcode="PL1 1QQ",
         client_name="API User",
         status="active",
         created_at=datetime.now(timezone.utc),
@@ -195,11 +207,11 @@ async def test_verify_matches_endpoint_with_real_land_registry_client(
 
     fraud_match = FraudMatch(
         property_listing_id=listing.id,
-        ppd_transaction_id="api-tx-1",
+        ppd_transaction_id="eoov-fm-1",
         ppd_price=400000,
         ppd_transfer_date=datetime(2024, 6, 1),
-        ppd_postcode="AP1 1PI",
-        ppd_full_address="200 API Road",
+        ppd_postcode="PL1 1QQ",
+        ppd_full_address="24 DOVEDALE ROAD PLYMOUTH",
         confidence_score=93.0,
         address_similarity=94.0,
         risk_level="HIGH",

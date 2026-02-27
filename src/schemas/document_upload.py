@@ -4,7 +4,7 @@ Document upload request and response schemas.
 
 from typing import Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentUploadRequest(BaseModel):
@@ -16,25 +16,8 @@ class DocumentUploadRequest(BaseModel):
         field_mapping: Dictionary mapping agency columns to system fields
     """
 
-    agency_id: str = Field(
-        ...,
-        description="Unique identifier for the agency uploading the document",
-        example="550e8400-e29b-41d4-a716-446655440000",
-    )
-    field_mapping: Dict[str, str] = Field(
-        ...,
-        description="Mapping of agency document columns to system field names",
-        example={
-            "Property Address": "address",
-            "Client Full Name": "client_name",
-            "Status": "status",
-            "Date Withdrawn": "withdrawn_date",
-            "Postcode": "postcode",
-        },
-    )
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "agency_id": "550e8400-e29b-41d4-a716-446655440000",
                 "field_mapping": {
@@ -46,6 +29,16 @@ class DocumentUploadRequest(BaseModel):
                 },
             }
         }
+    )
+
+    agency_id: str = Field(
+        ...,
+        description="Unique identifier for the agency uploading the document",
+    )
+    field_mapping: Dict[str, str] = Field(
+        ...,
+        description="Mapping of agency document columns to system field names",
+    )
 
 
 class DocumentUploadResponse(BaseModel):
@@ -60,32 +53,8 @@ class DocumentUploadResponse(BaseModel):
         message: Human-readable status message
     """
 
-    upload_id: str = Field(
-        ...,
-        description="Unique identifier for this upload operation",
-        example="660e8400-e29b-41d4-a716-446655440001",
-    )
-    status: str = Field(
-        ...,
-        description="Upload status: success, partial_success, or failed",
-        example="success",
-    )
-    records_processed: int = Field(
-        ...,
-        description="Number of records successfully processed and stored",
-        example=150,
-    )
-    records_skipped: int = Field(
-        ..., description="Number of duplicate records skipped", example=5
-    )
-    message: str = Field(
-        ...,
-        description="Human-readable status message",
-        example="Document processed successfully",
-    )
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "upload_id": "660e8400-e29b-41d4-a716-446655440001",
                 "status": "success",
@@ -94,3 +63,24 @@ class DocumentUploadResponse(BaseModel):
                 "message": "Document processed successfully",
             }
         }
+    )
+
+    upload_id: str = Field(
+        ...,
+        description="Unique identifier for this upload operation",
+    )
+    status: str = Field(
+        ...,
+        description="Upload status: success, partial_success, or failed",
+    )
+    records_processed: int = Field(
+        ...,
+        description="Number of records successfully processed and stored",
+    )
+    records_skipped: int = Field(
+        ..., description="Number of duplicate records skipped"
+    )
+    message: str = Field(
+        ...,
+        description="Human-readable status message",
+    )
