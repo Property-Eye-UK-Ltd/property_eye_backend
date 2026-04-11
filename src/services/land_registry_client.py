@@ -7,6 +7,7 @@ for the rest of the application.
 """
 
 import logging
+import re
 import ssl
 import uuid
 from typing import Optional
@@ -69,6 +70,7 @@ class LandRegistryClient:
         #   test:       /b2b/EOOV_StubService/OnlineOwnershipVerificationV1_0WebService
         #   production: /b2b/EOOV_SoapEngine/OnlineOwnershipVerificationV1_0WebService
         is_test = "bgtest" in base_url
+        self._is_test_mode = is_test
         stub_or_engine = "EOOV_StubService" if is_test else "EOOV_SoapEngine"
         self._oov_path = (
             f"/b2b/{stub_or_engine}/OnlineOwnershipVerificationV1_0WebService"
@@ -142,6 +144,7 @@ class LandRegistryClient:
         postcode: str,
         expected_owner_name: str,
         message_id: Optional[str] = None,
+        title_number: Optional[str] = None,
     ) -> OwnershipVerificationResult:
         """
         High-level ownership verification using OOV behind the scenes.
@@ -153,6 +156,25 @@ class LandRegistryClient:
         logger.info(
             "Verifying ownership for %s, %s via OOV", property_address, postcode
         )
+
+        # Enforce Land Registry input criteria only outside test mode.
+        precheck_error = self._validate_request_prechecks(
+            property_address=property_address,
+            postcode=postcode,
+            title_number=title_number,
+        )
+        if precheck_error and not self._is_test_mode:
+            logger.warning(
+                "OOV precheck rejected request: %s - %s",
+                precheck_error["status_code"],
+                precheck_error["status_message"],
+            )
+            return OwnershipVerificationResult(
+                owner_name=None,
+                verification_status="error",
+                error_message=f"{precheck_error['status_code']}: {precheck_error['status_message']}",
+                raw_response=precheck_error,
+            )
 
         # Build a minimal OOV request from the flat address and expected owner name.
         building_part, street_part = self._split_address(property_address)
@@ -166,15 +188,17 @@ class LandRegistryClient:
         )
 
         if message_id:
-            # Sanitise: MessageId must be 5-50 chars, pattern [a-zA-Z0-9][a-zA-Z0-9\-]*
+            # Sanitise: Reference must be 1-25 chars, pattern [a-zA-Z0-9][a-zA-Z0-9\-]*
             import re
-            safe_id = re.sub(r"[^a-zA-Z0-9\-]", "-", message_id)[:50]
-            if not safe_id[0].isalnum():
-                safe_id = "PE-" + safe_id
-            ref = safe_id if len(safe_id) >= 5 else f"PE-{safe_id}"
+            safe_id = re.sub(r"[^a-zA-Z0-9\-]", "-", message_id)[:25]
+            # Strip leading non-alnum chars
+            safe_id = re.sub(r"^[^a-zA-Z0-9]+", "", safe_id)
+            if not safe_id:
+                safe_id = str(uuid.uuid4()).replace("-", "")[:22]
+            ref = safe_id[:25]
         else:
-            short_id = str(uuid.uuid4()).replace("-", "")[:20]
-            ref = f"PE-{short_id}"
+            short_id = str(uuid.uuid4()).replace("-", "")[:22]
+            ref = f"PE{short_id}"[:25]
 
         oov_request = OovRequest(
             external_reference=ref,
@@ -190,7 +214,7 @@ class LandRegistryClient:
             ),
             company_name=None,
             address=address,
-            title_number=None,
+            title_number=title_number,
             historical_match=True,
             partial_match=True,
             highlight_additional_owners=True,
@@ -228,7 +252,7 @@ class LandRegistryClient:
             return OwnershipVerificationResult(
                 owner_name=None,
                 verification_status="error",
-                error_message=oov_response.status_message,
+                error_message=f"{oov_response.status_code}: {oov_response.status_message}",
                 raw_response=oov_response.model_dump(),
             )
 
@@ -240,7 +264,7 @@ class LandRegistryClient:
             return OwnershipVerificationResult(
                 owner_name=None,
                 verification_status="error",
-                error_message=oov_response.status_message,
+                error_message=f"{oov_response.status_code}: {oov_response.status_message}",
                 raw_response=oov_response.model_dump(),
             )
 
@@ -258,6 +282,77 @@ class LandRegistryClient:
             error_message=None,
             raw_response=oov_response.model_dump(),
         )
+
+    def _validate_request_prechecks(
+        self,
+        property_address: str,
+        postcode: str,
+        title_number: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Validate key LR business-rule criteria before sending live requests."""
+        clean_postcode = (postcode or "").strip().upper()
+        clean_address = (property_address or "").strip()
+
+        # BRL-ISBG-011: validate title number format when provided.
+        if title_number:
+            if not self._is_valid_title_number(title_number):
+                return {
+                    "status_code": "bg.title.invalid",
+                    "status_message": "Title number is invalid",
+                    "message_id": "MSG-BG-010",
+                    "business_rule": "BRL-ISBG-011",
+                }
+            return None
+
+        # BRL-ISBG-002: postcode must be syntactically valid.
+        if not self._is_valid_uk_postcode(clean_postcode):
+            return {
+                "status_code": "bg.postcode.invalid",
+                "status_message": "Please provide valid postcode",
+                "message_id": "MSG-BG-004",
+                "business_rule": "BRL-ISBG-002",
+            }
+
+        # BRL-ISBG-081: minimum address details check.
+        building_part, street_part = self._split_address(clean_address)
+        has_building = bool(building_part)
+        has_street = bool(street_part)
+        has_postcode = bool(clean_postcode)
+        has_city = self._looks_like_city_present(clean_address)
+        valid_address = has_building and (has_postcode or (has_street and has_city))
+        if not valid_address:
+            return {
+                "status_code": "bg.address.invalidaddresscriteria",
+                "status_message": (
+                    "Insufficient address details. Please provide house name or number "
+                    "and postcode OR house name or number, street and city"
+                ),
+                "message_id": "MSG-BG-136",
+                "business_rule": "BRL-ISBG-081",
+            }
+
+        return None
+
+    def _is_valid_uk_postcode(self, postcode: str) -> bool:
+        """Check whether a postcode matches UK postcode syntax."""
+        postcode_pattern = (
+            r"^(GIR 0AA|"
+            r"((([A-Z]{1,2}[0-9][A-Z0-9]?)|"
+            r"(([A-Z]{1,2}[0-9]{2})))[ ]?[0-9][A-Z]{2}))$"
+        )
+        return bool(re.match(postcode_pattern, postcode.strip().upper()))
+
+    def _is_valid_title_number(self, title_number: str) -> bool:
+        """Check title number syntax (letters prefix + numeric suffix)."""
+        candidate = title_number.strip().upper()
+        return bool(re.match(r"^[A-Z]{1,4}[0-9]{1,12}$", candidate))
+
+    def _looks_like_city_present(self, full_address: str) -> bool:
+        """Detect whether a free-form address appears to include a town/city."""
+        # Simple heuristic: comma-separated address with at least 3 components
+        # usually includes town/city near the end.
+        parts = [p.strip() for p in full_address.split(",") if p.strip()]
+        return len(parts) >= 3
 
     async def close(self) -> None:
         """Close the underlying HTTP client connection."""

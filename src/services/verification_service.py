@@ -6,7 +6,7 @@ Processes suspicious matches through Land Registry API to confirm fraud cases.
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List
 
 from sqlalchemy import select
@@ -123,7 +123,7 @@ class VerificationService:
                 verification_status="error",
                 verified_owner_name=None,
                 is_confirmed_fraud=False,
-                verified_at=datetime.now(timezone.utc),
+                verified_at=datetime.utcnow(),
                 error_message="Match not found in database",
             )
 
@@ -143,7 +143,7 @@ class VerificationService:
             fraud_match.land_registry_response = (
                 json.dumps(api_result.raw_response) if api_result.raw_response else None
             )
-            fraud_match.verified_at = datetime.now(timezone.utc)
+            fraud_match.verified_at = datetime.utcnow()
 
             # API/infrastructure failure — could not complete verification.
             if api_result.verification_status == "error":
@@ -215,7 +215,7 @@ class VerificationService:
 
             fraud_match.verification_status = "error"
             fraud_match.is_confirmed_fraud = False
-            fraud_match.verified_at = datetime.now(timezone.utc)
+            fraud_match.verified_at = datetime.utcnow()
             await db.commit()
 
             return VerificationResult(
