@@ -5,6 +5,10 @@
 # Only a single sample row + optional context row is ever sent to the model.
 # All private listing data stays local.
 #
+# The reviewer node is DETERMINISTIC Python — not an LLM — so it cannot hallucinate.
+# It checks hard structural rules (bounds, bare-index misuse, commission signals).
+# If the extractor's first pass is valid it is approved immediately at zero extra cost.
+#
 # Two prompt modes:
 #   header_mode — the file has real column header names (CSV or PDF with header row).
 #                 The AI just name-matches; much cleaner and more reliable.
@@ -19,7 +23,7 @@ import os
 import re
 from typing import Annotated, Any, Dict, List, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage  # SystemMessage used by extractor prompts
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
@@ -181,47 +185,106 @@ _EXTRACTOR_SYSTEM_DATA = SystemMessage(
     )
 )
 
-_REVIEWER_SYSTEM = SystemMessage(
-    content=(
-        "You are a meticulous schema auditor. You receive a sample row and a proposed column map.\n\n"
-        "EVALUATION PROTOCOL — follow these steps in order for EVERY field:\n\n"
-        "Step 1 — READ THE ACTUAL MAPPING VALUE first.\n"
-        "  Look up what the proposed column map says for each field (e.g. '0', '>0', '5+6', null).\n"
-        "  Do NOT apply any rule until you have read that value.\n\n"
-        "Step 2 — Apply the rules below ONLY based on what you actually read:\n\n"
-        "  Rule A — Bounds check:\n"
-        "    If the value is a bare index or concat (e.g. '2', '5+6'), verify the index exists in the row.\n\n"
-        "  Rule B — '>N' check (ONLY applies when the value is a BARE INDEX like '0', '2', not '>0', '>2'):\n"
-        "    If the value is '>N' — the field is ALREADY correctly using extraction. DO NOT flag it.\n"
-        "    Only flag if the value is a bare 'N' (no '>') AND the cell content contains more than\n"
-        "    just the canonical value. Specifically:\n"
-        "      • Flag postcode='N' if cell N is a full address string (contains commas + street name).\n"
-        "        DO NOT flag postcode='>N' — it is already correct.\n"
-        "      • Flag price='N' if cell N contains narrative words: 'Offers', 'in excess of',\n"
-        "        'Guide price', 'OIEO', 'POA', 'approximately'. A cell with just '£699,950' is fine as 'N'.\n"
-        "        DO NOT flag price='>N' — it is already correct.\n"
-        "      • Flag region='N' or county='N' if cell N is a combined full address string.\n"
-        "        DO NOT flag region='>N' or county='>N' — already correct.\n\n"
-        "  Rule C — Wrong cell check:\n"
-        "    Flag if a field is clearly mapped to the wrong type (e.g. a date cell mapped to price).\n\n"
-        "  Rule D — Commission check:\n"
-        "    Flag commission=null ONLY if you can see a cell that literally contains a % symbol\n"
-        "    or the words 'commission', 'agency fee', or 'sole agency' / 'multi agency' with a rate.\n"
-        "    A plain price like '£699,950' is NOT evidence of commission. Do NOT flag commission=null\n"
-        "    just because price is present.\n\n"
-        "  Rule E — Title number vs property number:\n"
-        "    title_number refers to an HMLR title number (e.g. 'HD567890', 'TGL12345' — letters then digits).\n"
-        "    property_number is the house number ('11', 'Flat 3'). These are different fields.\n"
-        "    Do NOT flag title_number=null because a property number exists.\n\n"
-        "  Rule F — Uncertain flag:\n"
-        "    If a field uses 'N?', verify the cell content; suggest removing '?' if the mapping is clearly correct.\n\n"
-        "Respond with ONLY valid JSON in one of two forms:\n"
-        '  { "approved": true }\n'
-        '  { "approved": false, "critique": "<cite the field name, its actual mapped value, and why it is wrong>" }'
-    )
-)
-
 MAX_ITERATIONS = 3
+
+# ---------------------------------------------------------------------------
+# Deterministic reviewer — replaces the LLM reviewer entirely
+# ---------------------------------------------------------------------------
+
+# Narrative words that mean a price cell needs ">N" not a bare index
+_PRICE_NARRATIVE_RE = re.compile(
+    r"\b(offers?\s+in\s+excess\s+of|guide\s+price|oieo|poa|approximately|asking\s+price)\b",
+    re.IGNORECASE,
+)
+# Any cell that contains a "%" or explicit commission vocabulary
+_COMMISSION_SIGNAL_RE = re.compile(
+    r"%|commission|agency\s+fee|sole\s+agency|multi.?agency",
+    re.IGNORECASE,
+)
+# A cell that looks like a full comma-separated address (multi-segment)
+_FULL_ADDRESS_RE = re.compile(r"[A-Za-z][^,]+,[^,]+[A-Za-z]")
+
+# DSL instruction patterns (must match column_mapper.py)
+_RE_EXTRACT = re.compile(r"^>(\d+)$")
+_RE_CONCAT = re.compile(r"^(\d+)(\+\d+)+$")
+_RE_DIRECT = re.compile(r"^(\d+)\??$")
+
+
+def _parse_instr(instr: str):
+    """Return (indices, is_extract) from a DSL value string; ([], False) if unrecognised."""
+    s = instr.strip().rstrip("?")
+    m = _RE_EXTRACT.match(s)
+    if m:
+        return [int(m.group(1))], True
+    if _RE_CONCAT.match(s):
+        return [int(i) for i in s.split("+")], False
+    m2 = _RE_DIRECT.match(s)
+    if m2:
+        return [int(m2.group(1))], False
+    return [], False
+
+
+def _deterministic_review(
+    mapping: Dict[str, Any],
+    sample_row: List[str],
+) -> tuple[bool, Optional[str]]:
+    """
+    Validate a DSL mapping against the sample row using hard coded rules.
+    Returns (approved, critique_or_None).
+    """
+    issues: List[str] = []
+    n_cols = len(sample_row)
+
+    for field, instr in mapping.items():
+        if instr is None:
+            continue
+
+        indices, is_extract = _parse_instr(str(instr))
+
+        # Rule 1 — Index bounds: all referenced indices must exist
+        for idx in indices:
+            if idx >= n_cols:
+                issues.append(
+                    f"'{field}' references index {idx} but row has only "
+                    f"{n_cols} column(s) (0–{n_cols - 1})"
+                )
+
+        # Rules below only apply to bare-index (non->N) single-column mappings
+        if is_extract or len(indices) != 1:
+            continue
+        idx = indices[0]
+        if idx >= n_cols:
+            continue
+        cell = sample_row[idx]
+
+        # Rule 2 — Price in narrative cell: bare index when ">N" is needed
+        if field == "price" and _PRICE_NARRATIVE_RE.search(cell):
+            issues.append(
+                f"'price' uses bare index '{instr}' but cell contains narrative "
+                f"(e.g. '{cell[:60]}') — use '>N' to extract just the amount"
+            )
+
+        # Rule 3 — Postcode/region/county: bare index when cell is a full address
+        if field in ("postcode", "region", "county") and _FULL_ADDRESS_RE.search(cell):
+            issues.append(
+                f"'{field}' uses bare index '{instr}' but cell looks like a full "
+                f"address ('{cell[:60]}') — use '>N' to extract the value"
+            )
+
+    # Rule 4 — Commission null despite visible commission signal in any cell
+    if mapping.get("commission") is None:
+        for cell in sample_row:
+            if _COMMISSION_SIGNAL_RE.search(cell):
+                issues.append(
+                    f"'commission' is null but a commission signal was detected "
+                    f"in the row ('{cell[:60]}')"
+                )
+                break
+
+    if issues:
+        critique = "; ".join(issues)
+        return False, critique
+    return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -427,48 +490,28 @@ def _extractor_node(state: AgentState, model) -> Dict[str, Any]:
     }
 
 
-def _reviewer_node(state: AgentState, model) -> Dict[str, Any]:
-    """Validate the latest mapping; approve or return a critique."""
+def _reviewer_node(state: AgentState, _model) -> Dict[str, Any]:
+    """Validate the mapping deterministically — no LLM call, no hallucinations."""
+    mapping = state.get("last_mapping") or {}
     sample_row = state["sample_row"]
-    header_row = state.get("header_row")
-    mapping_text = json.dumps(state.get("last_mapping", {}), indent=2)
+    iteration = state.get("iteration", 0)
 
-    if header_row:
-        row_text = (
-            "Column headers:\n"
-            + _format_indexed_list(header_row, "header")
-            + "\n\nFirst data row (for content verification):\n"
-            + _format_indexed_list(sample_row, "data row")
-        )
+    logger.info(
+        "Reviewer (deterministic) iteration=%s mapping_keys=%s",
+        iteration,
+        len(mapping),
+    )
+
+    approved, critique = _deterministic_review(mapping, sample_row)
+
+    if approved:
+        logger.info("Reviewer approved mapping")
     else:
-        row_text = _format_indexed_list(sample_row, "primary row")
+        logger.info("Reviewer rejected mapping — critique: %s", critique)
 
-    user_content = f"{row_text}\n\nProposed column map:\n{mapping_text}"
-    logger.info(
-        "Reviewer node started iteration=%s mapping_keys=%s",
-        state.get("iteration", 0),
-        len((state.get("last_mapping") or {}).keys()),
-    )
-    response = model.invoke([_REVIEWER_SYSTEM, HumanMessage(content=user_content)])
-    # Log the reviewer node's full model response for reflection transparency.
-    logger.info(
-        "Reviewer output (iteration=%s): %s",
-        state.get("iteration", 0),
-        str(response.content),
-    )
-
-    try:
-        verdict = _parse_json_from_response(response.content)
-        approved = bool(verdict.get("approved", False))
-        logger.info("Reviewer verdict parsed approved=%s", approved)
-        # logger.info(
-        #     "Reviewer parsed verdict JSON: %s", json.dumps(verdict, ensure_ascii=False)
-        # )
-    except (json.JSONDecodeError, ValueError):
-        logger.exception("Reviewer returned invalid JSON; defaulting to approved=True")
-        approved = True  # malformed verdict → accept current mapping
-
-    return {"messages": [response], "approved": approved}
+    # Package the critique as an AIMessage so the extractor can pick it up on retry
+    critique_msg = AIMessage(content=f"critique: {critique}" if critique else "approved")
+    return {"messages": [critique_msg], "approved": approved}
 
 
 def _should_continue(state: AgentState) -> str:
