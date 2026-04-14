@@ -11,12 +11,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .column_mapper import interpret as mapper_interpret
 from .column_mapper import validate_mapping
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -41,15 +44,23 @@ def _extract_structured_csv(
     """
     import pandas as pd
 
+    logger.info("CSV extraction started for: %s", path)
     df = pd.read_csv(path, dtype=str, keep_default_na=False)
     header_row: List[str] = df.columns.tolist()
     raw_rows: List[List[str]] = df.values.tolist()  # type: ignore[assignment]
+    logger.info(
+        "CSV loaded: %s data row(s), %s header column(s)",
+        len(raw_rows),
+        len(header_row),
+    )
 
     if not raw_rows:
+        logger.warning("CSV has no data rows: %s", path)
         return []
 
     if skip_ai:
         # Return raw dicts keyed by original CSV headers (useful for offline smoke tests)
+        logger.info("CSV extraction running in --skip-ai mode")
         return [dict(zip(header_row, row)) for row in raw_rows]
 
     from .ai_agent import run_agent
@@ -60,16 +71,20 @@ def _extract_structured_csv(
         header_row=header_row,
         model=model,
     )
+    logger.info("AI mapping completed for CSV sample row")
 
     if not mapping:
+        logger.warning("AI returned empty mapping for CSV; falling back to raw header dicts")
         return [dict(zip(header_row, row)) for row in raw_rows]
 
     warnings = validate_mapping(mapping, raw_rows[0])
     for w in warnings:
-        print(f"[extractor/csv] WARNING: {w}", file=sys.stderr)
+        logger.warning("[extractor/csv] %s", w)
 
     structured = [mapper_interpret(mapping, row) for row in raw_rows]
-    return [r for r in structured if any(v for v in r.values() if v)]
+    filtered = [r for r in structured if any(v for v in r.values() if v)]
+    logger.info("CSV extraction finished with %s structured row(s)", len(filtered))
+    return filtered
 
 
 def _extract_structured_pdf(
@@ -82,6 +97,7 @@ def _extract_structured_pdf(
     run the AI agent, then apply the DSL mapping to all stitched rows.
     """
     _ensure_project_root()
+    logger.info("PDF extraction started for: %s", path)
 
     from lib.pdf_csv_extractor import ImagePdfError
     from lib.pdf_csv_extractor import extract_from_pdf
@@ -89,13 +105,30 @@ def _extract_structured_pdf(
     try:
         outcome = extract_from_pdf(path)
     except ImagePdfError as exc:
+        logger.error("PDF appears image-only or text not extractable: %s", exc)
         raise ValueError(str(exc)) from exc
+    except Exception:
+        logger.exception("Unhandled error while parsing PDF source rows")
+        raise
+
+    logger.info(
+        "PDF raw extraction source=%s raw_rows=%s fallback_rows=%s header_row=%s",
+        outcome.source,
+        len(outcome.raw_rows or []),
+        len(outcome.rows or []),
+        bool(outcome.header_row),
+    )
 
     if outcome.source == "none" or not outcome.raw_rows:
         # Nothing was extractable — return whatever the regex extractor managed
+        logger.warning(
+            "No raw table rows extracted from PDF; returning fallback rows count=%s",
+            len(outcome.rows),
+        )
         return outcome.rows
 
     if skip_ai:
+        logger.info("PDF extraction running in --skip-ai mode")
         return outcome.rows
 
     from .ai_agent import run_agent
@@ -104,9 +137,16 @@ def _extract_structured_pdf(
 
     # 1. Stitch continuation rows so the AI sees complete logical records
     stitched = stitch(outcome.raw_rows)
+    logger.info("Row stitching complete: input=%s stitched=%s", len(outcome.raw_rows), len(stitched))
 
     # 2. Pick the richest sample row (up to row index 2) plus a context row
     best_row, context_row, is_continuation = select_sample_rows(stitched)
+    logger.info(
+        "Row selection complete: best_row_cells=%s context_present=%s continuation=%s",
+        len(best_row),
+        context_row is not None,
+        is_continuation,
+    )
 
     # 3. If the PDF exposed a real header row, use header-mode (more reliable)
     mapping = run_agent(
@@ -116,16 +156,20 @@ def _extract_structured_pdf(
         header_row=outcome.header_row,
         model=model,
     )
+    logger.info("AI mapping completed for PDF sample row")
 
     if not mapping:
+        logger.warning("AI returned empty mapping for PDF; falling back to regex-classified rows")
         return outcome.rows
 
     warnings = validate_mapping(mapping, best_row)
     for w in warnings:
-        print(f"[extractor/pdf] WARNING: {w}", file=sys.stderr)
+        logger.warning("[extractor/pdf] %s", w)
 
     structured = [mapper_interpret(mapping, row) for row in stitched]
-    return [r for r in structured if any(v for v in r.values() if v)]
+    filtered = [r for r in structured if any(v for v in r.values() if v)]
+    logger.info("PDF extraction finished with %s structured row(s)", len(filtered))
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -154,9 +198,16 @@ def extract_structured(
     """
     p = Path(path)
     if not p.exists():
+        logger.error("Input file does not exist: %s", path)
         raise FileNotFoundError(f"File not found: {path}")
 
     suffix = p.suffix.lower()
+    logger.info(
+        "Dispatching extractor for file=%s suffix=%s skip_ai=%s",
+        path,
+        suffix or "<none>",
+        skip_ai,
+    )
     if suffix == ".csv":
         return _extract_structured_csv(path, model=model, skip_ai=skip_ai)
     return _extract_structured_pdf(path, model=model, skip_ai=skip_ai)
@@ -184,12 +235,25 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip the AI agent; return regex/header-classified rows only (no API calls)",
     )
+    ap.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose extractor logs (step-by-step progress + errors)",
+    )
     args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
     try:
         rows = extract_structured(args.file, skip_ai=args.skip_ai)
-    except (ValueError, FileNotFoundError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+    except (ValueError, FileNotFoundError):
+        logger.exception("Extractor failed with handled error")
+        sys.exit(1)
+    except Exception:
+        logger.exception("Extractor failed with unhandled error")
         sys.exit(1)
 
     output = json.dumps(rows, indent=2, ensure_ascii=False)
