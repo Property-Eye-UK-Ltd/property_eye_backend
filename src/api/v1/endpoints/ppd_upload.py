@@ -76,6 +76,17 @@ async def upload_ppd_csv(
     # Default month to 0 as we are now using year-only partitioning
     month = 0
 
+    # Prevent duplicate uploads for the same year
+    stmt = select(PPDUploadJob).where(PPDUploadJob.year == year)
+    result = await db.execute(stmt)
+    existing_job = result.scalars().first()
+
+    if existing_job:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"An official record for the year {year} already exists. Please delete it first before uploading a new one."
+        )
+
     logger.info(f"Starting PPD upload: {safe_filename} (year={year})")
 
     try:

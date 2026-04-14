@@ -102,6 +102,12 @@ class Settings(BaseSettings):
     ALTO_CLIENT_SECRET: str
     ALTO_INTEGRATION_ID: str
 
+    # AI Configuration (Column Mapping Agent)
+    GOOGLE_API_KEY: Optional[str] = None
+    GROQ_API_KEY: Optional[str] = None
+    EXTRACTOR_LLM_PROVIDER: str = "gemini"
+    EXTRACTOR_LLM_MODEL: Optional[str] = None
+
     # # Optional: per-agency identifiers if needed globally
     # ALTO_DEFAULT_AGENCY_ID: Optional[str] = None
     # ALTO_DEFAULT_BRANCH_ID: Optional[str] = None

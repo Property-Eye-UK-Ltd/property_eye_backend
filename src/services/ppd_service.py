@@ -122,22 +122,28 @@ class PPDService:
     ) -> IngestionSummary:
         """
         Ingest PPD CSV and convert to Parquet format.
+        
+        Offloads the heavy synchronous data processing to a background thread
+        so it doesn't block the asyncio event loop.
+        """
+        import asyncio
+        return await asyncio.to_thread(
+            self._ingest_ppd_csv_blocking, csv_path, year, month
+        )
 
+    def _ingest_ppd_csv_blocking(
+        self, csv_path: str, year: int, month: int = 0
+    ) -> IngestionSummary:
+        """
+        Synchronous blocking logic for PPD ingestion.
+        
         Steps:
         1. Read CSV with pandas
         2. Normalize addresses
         3. Validate data
-        4. Sort data by transfer_date and postcode (indexing optimization)
+        4. Sort data by transfer_date and postcode
         5. Write to partitioned Parquet file
         6. Return summary
-
-        Args:
-            csv_path: Path to PPD CSV file
-            year: Year for partitioning
-            month: Month (unused for partitioning now, kept for compatibility)
-
-        Returns:
-            IngestionSummary with success/failure counts
         """
         summary = IngestionSummary()
 
@@ -161,8 +167,6 @@ class PPDService:
                 lambda addr: self.address_normalizer.normalize(addr)
             )
             df["year"] = year
-            # Month is no longer used for partitioning, but we can keep it in the data if needed
-            # df["month"] = month 
 
             # Validate data
             valid_df = df.dropna(

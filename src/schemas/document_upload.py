@@ -39,6 +39,10 @@ class ListingsIngestRequest(BaseModel):
     )
 
 
+# Backward-compatible alias for legacy imports expecting the old request schema name.
+DocumentUploadRequest = ListingsIngestRequest
+
+
 class DocumentUploadResponse(BaseModel):
     """
     Response schema for document upload.

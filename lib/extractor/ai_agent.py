@@ -19,14 +19,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import Annotated, Any, Dict, List, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage  # SystemMessage used by extractor prompts
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+)  # SystemMessage used by extractor prompts
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
+
+from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -325,9 +330,9 @@ def _build_gemini_model(model_name: str):
             "Run: pip install langchain-google-genai"
         ) from exc
 
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    api_key = settings.GOOGLE_API_KEY
     if not api_key:
-        logger.error("GOOGLE_API_KEY is missing from environment")
+        logger.error("GOOGLE_API_KEY is missing from settings")
         raise EnvironmentError(
             "GOOGLE_API_KEY is not set. Add it to .env or the environment."
         )
@@ -349,9 +354,9 @@ def _build_groq_model(model_name: str):
             "langchain-groq is required for Groq. Run: pip install langchain-groq"
         ) from exc
 
-    api_key = os.environ.get("GROQ_API_KEY", "")
+    api_key = settings.GROQ_API_KEY
     if not api_key:
-        logger.error("GROQ_API_KEY is missing from environment")
+        logger.error("GROQ_API_KEY is missing from settings")
         raise EnvironmentError(
             "GROQ_API_KEY is not set. Add it to .env or the environment."
         )
@@ -366,8 +371,8 @@ def _build_groq_model(model_name: str):
 # Resolve provider and model from env, then build the chat model.
 def _build_default_model():
     """Construct the default provider model based on environment variables."""
-    provider = os.environ.get("EXTRACTOR_LLM_PROVIDER", "gemini").strip().lower()
-    model_name = os.environ.get("EXTRACTOR_LLM_MODEL", "").strip()
+    provider = (settings.EXTRACTOR_LLM_PROVIDER or "gemini").strip().lower()
+    model_name = (settings.EXTRACTOR_LLM_MODEL or "").strip()
 
     if provider == "gemini":
         resolved_model = model_name or "gemini-2.5-flash-lite"
@@ -510,7 +515,9 @@ def _reviewer_node(state: AgentState, _model) -> Dict[str, Any]:
         logger.info("Reviewer rejected mapping — critique: %s", critique)
 
     # Package the critique as an AIMessage so the extractor can pick it up on retry
-    critique_msg = AIMessage(content=f"critique: {critique}" if critique else "approved")
+    critique_msg = AIMessage(
+        content=f"critique: {critique}" if critique else "approved"
+    )
     return {"messages": [critique_msg], "approved": approved}
 
 
