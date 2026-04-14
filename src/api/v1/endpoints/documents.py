@@ -4,15 +4,17 @@ Document upload API endpoints.
 Handles agency document uploads with field mapping and validation.
 """
 
+import json
 import logging
+import os
 import pandas as pd
 import uuid
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Dict
+from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,10 +22,13 @@ from src.api import deps
 from src.db.session import get_db
 from src.models.agency import Agency
 from src.models.property_listing import PropertyListing
-from src.schemas.document_upload import DocumentUploadResponse
+from src.schemas.document_upload import DocumentUploadResponse, ListingsIngestRequest
 from src.services.address_normalizer import AddressNormalizer
-from src.services.document_parser import DocumentParser
 from src.utils.constants import config
+
+from lib.extractor import extract_structured
+from lib.extractor.ai_agent import run_agent
+from lib.extractor.column_mapper import interpret as map_interpret
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +56,14 @@ def parse_date(date_value) -> datetime.date:
 
     if isinstance(date_value, str):
         # Try common date formats
-        for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"]:
+        for fmt in [
+            "%Y-%m-%d",
+            "%d/%m/%Y",
+            "%m/%d/%Y",
+            "%Y/%m/%d",
+            "%d %B %Y",
+            "%d %b %Y",
+        ]:
             try:
                 return datetime.strptime(date_value, fmt).date()
             except ValueError:
@@ -62,67 +74,96 @@ def parse_date(date_value) -> datetime.date:
     return date_value
 
 
+def _coerce_str(value: Any) -> str | None:
+    """Convert a value to cleaned string or None for empty values."""
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _normalise_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Map incoming dict payloads to canonical extractor field names."""
+    aliases = {
+        "clientName": "client_name",
+        "propertyNumber": "property_number",
+        "titleNumber": "title_number",
+        "withdrawnDate": "withdrawn_date",
+        "contractDuration": "contract_duration",
+    }
+    out: Dict[str, Any] = {}
+    for k, v in record.items():
+        key = aliases.get(k, k)
+        out[key] = v
+    return out
+
+
+def _extract_rows_from_nested_lists(rows: List[Any]) -> List[Dict[str, Any]]:
+    """Convert nested row payloads (list[list|dict]) into canonical record dicts."""
+    if not rows:
+        return []
+
+    # If caller sends list-of-dicts, trust keys and normalize aliases.
+    if isinstance(rows[0], dict):
+        return [_normalise_record(dict(r)) for r in rows if isinstance(r, dict)]
+
+    # If caller sends nested lists, infer mapping from first row then map all rows.
+    if isinstance(rows[0], list):
+        raw_rows = [r for r in rows if isinstance(r, list)]
+        if not raw_rows:
+            return []
+        mapping = run_agent(sample_row=raw_rows[0])
+        return [map_interpret(mapping, r) for r in raw_rows]
+
+    raise ValueError("rows must be list[dict] or list[list]")
+
+
+def _listing_response_payload(listing: PropertyListing) -> Dict[str, Any]:
+    """Build a consistent listing response object for frontend rendering."""
+    return {
+        "id": listing.id,
+        "address": listing.address,
+        "postcode": listing.postcode,
+        "region": listing.region,
+        "county": listing.county,
+        "property_number": listing.property_number,
+        "title_number": listing.title_number,
+        "client_name": listing.client_name,
+        "status": listing.status,
+        "withdrawn_date": listing.withdrawn_date,
+        "price": listing.price,
+        "commission": listing.commission,
+        "contract_duration": listing.contract_duration,
+        "created_at": listing.created_at,
+    }
+
+
 @router.post(
     "/upload",
     response_model=DocumentUploadResponse,
     status_code=status.HTTP_200_OK,
-    summary="Upload agency document",
+    summary="Upload agency document (CSV/PDF)",
     description="""
-    Upload an agency property listing document (CSV, Excel, or PDF).
-    
-    The document must include all required fields mapped via the field_mapping parameter.
-    Duplicate records (same address and listing date) will be skipped.
-    
-    Required fields: address, client_name, status, withdrawn_date, postcode
+    Upload an agency property listing document (CSV or PDF).
+    Field mapping is automatic via the extractor pipeline.
+    Duplicate records (same normalized address) are skipped.
     """,
 )
 async def upload_document(
-    field_mapping: str = Form(
-        ..., description="JSON string mapping agency columns to system fields"
-    ),
     file: UploadFile = File(..., description="Document file (CSV, Excel, or PDF)"),
     current_agency: Agency = Depends(deps.get_current_agency),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Upload and process agency document.
-    """
+    """Upload and process a CSV/PDF with automatic extraction and mapping."""
     agency_id = current_agency.id
     logger.info(f"Received document upload for agency {agency_id}")
-
-    # Parse field mapping from JSON string
-    import json
-
-    try:
-        field_mapping_dict: Dict[str, str] = json.loads(field_mapping)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid field_mapping JSON format",
-        )
-
-    # Validate field mapping contains all required fields
-    # The frontend sends { system_field: csv_header }
-    missing_fields = [
-        field
-        for field in config.REQUIRED_FIELDS
-        if field not in field_mapping_dict.keys()
-    ]
-
-    if missing_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Field mapping missing required fields: {', '.join(missing_fields)}",
-        )
-
-    # Invert mapping for pandas rename: {system_field: csv_header} -> {csv_header: system_field}
-    # This is required because pandas.rename expects {old_name: new_name}
-    pandas_mapping = {v: k for k, v in field_mapping_dict.items()}
 
     # Save uploaded file temporarily
     file_extension = Path(file.filename).suffix
 
-    if file_extension.lower() not in config.ALLOWED_UPLOAD_EXTENSIONS:
+    if file_extension.lower() not in [".csv", ".pdf"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported file type: {file_extension}. Allowed: {', '.join(config.ALLOWED_UPLOAD_EXTENSIONS)}",
@@ -134,25 +175,26 @@ async def upload_document(
             temp_file.write(content)
             temp_file_path = temp_file.name
 
-        # Parse document
-        parser = DocumentParser()
-        df: pd.DataFrame = await parser.parse(
-            file_path=temp_file_path,
-            file_type=file_extension,
-            field_mapping=pandas_mapping,
-        )
-
-        logger.info(f"Parsed {len(df)} records from document")
+        # Parse with the AI extractor pipeline.
+        rows = extract_structured(temp_file_path)
+        logger.info(f"Parsed {len(rows)} records from extractor pipeline")
 
         # Process and store records
         address_normalizer = AddressNormalizer()
         records_processed = 0
         records_skipped = 0
 
-        for _, row in df.iterrows():
+        for row in rows:
+            row = _normalise_record(row)
+            address = _coerce_str(row.get("address"))
+            postcode = _coerce_str(row.get("postcode"))
+            if not address:
+                records_skipped += 1
+                continue
+
             # Normalize address
             normalized_address = address_normalizer.normalize(
-                str(row.get("address", "")), str(row.get("postcode", ""))
+                address, postcode or ""
             )
 
             # Check for duplicates
@@ -173,12 +215,19 @@ async def upload_document(
             # Create new property listing
             property_listing = PropertyListing(
                 agency_id=agency_id,
-                address=str(row.get("address", "")),
+                address=address,
                 normalized_address=normalized_address,
-                postcode=str(row.get("postcode", "")),
-                client_name=str(row.get("client_name", "")),
-                status=str(row.get("status", "")).lower(),
+                postcode=postcode,
+                region=_coerce_str(row.get("region")),
+                county=_coerce_str(row.get("county")),
+                property_number=_coerce_str(row.get("property_number")),
+                title_number=_coerce_str(row.get("title_number")),
+                client_name=_coerce_str(row.get("client_name")),
+                status=(_coerce_str(row.get("status")) or "").lower(),
                 withdrawn_date=withdrawn_date,
+                price=_coerce_str(row.get("price")),
+                commission=_coerce_str(row.get("commission")),
+                contract_duration=_coerce_str(row.get("contract_duration")),
             )
 
             db.add(property_listing)
@@ -204,12 +253,103 @@ async def upload_document(
         )
 
     except ValueError as e:
+        await db.rollback()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         logger.error(f"Error processing document: {str(e)}")
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process document: {str(e)}",
+        )
+
+
+@router.post(
+    "/ingest",
+    response_model=DocumentUploadResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Ingest listings payload (nested-list or manual dict)",
+)
+async def ingest_listings_payload(
+    payload: ListingsIngestRequest = Body(...),
+    current_agency: Agency = Depends(deps.get_current_agency),
+    db: AsyncSession = Depends(get_db),
+):
+    """Ingest listings from JSON payloads (rows list and/or single manual record)."""
+    agency_id = current_agency.id
+    logger.info("Received JSON listing ingest for agency %s", agency_id)
+
+    if not payload.rows and not payload.record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide at least one of: rows or record",
+        )
+
+    try:
+        extracted_rows: List[Dict[str, Any]] = []
+        if payload.rows:
+            extracted_rows.extend(_extract_rows_from_nested_lists(payload.rows))
+        if payload.record:
+            extracted_rows.append(_normalise_record(payload.record))
+
+        address_normalizer = AddressNormalizer()
+        records_processed = 0
+        records_skipped = 0
+
+        for row in extracted_rows:
+            address = _coerce_str(row.get("address"))
+            postcode = _coerce_str(row.get("postcode"))
+            if not address:
+                records_skipped += 1
+                continue
+
+            normalized_address = address_normalizer.normalize(address, postcode or "")
+            stmt = select(PropertyListing).where(
+                PropertyListing.agency_id == agency_id,
+                PropertyListing.normalized_address == normalized_address,
+            )
+            result = await db.execute(stmt)
+            existing = result.scalar_one_or_none()
+            if existing:
+                records_skipped += 1
+                continue
+
+            listing = PropertyListing(
+                agency_id=agency_id,
+                address=address,
+                normalized_address=normalized_address,
+                postcode=postcode,
+                region=_coerce_str(row.get("region")),
+                county=_coerce_str(row.get("county")),
+                property_number=_coerce_str(row.get("property_number")),
+                title_number=_coerce_str(row.get("title_number")),
+                client_name=_coerce_str(row.get("client_name")),
+                status=(_coerce_str(row.get("status")) or "").lower(),
+                withdrawn_date=parse_date(row.get("withdrawn_date")),
+                price=_coerce_str(row.get("price")),
+                commission=_coerce_str(row.get("commission")),
+                contract_duration=_coerce_str(row.get("contract_duration")),
+            )
+            db.add(listing)
+            records_processed += 1
+
+        await db.commit()
+        return DocumentUploadResponse(
+            upload_id=str(uuid.uuid4()),
+            status="success",
+            records_processed=records_processed,
+            records_skipped=records_skipped,
+            message="Listings ingested successfully",
+        )
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        await db.rollback()
+        logger.error("Error ingesting listings payload: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to ingest listings: {str(e)}",
         )
 
 
@@ -236,18 +376,7 @@ async def get_uploaded_listings(
     result = await db.execute(stmt)
     listings = result.scalars().all()
 
-    return [
-        {
-            "id": l.id,
-            "address": l.address,
-            "postcode": l.postcode,
-            "client_name": l.client_name,
-            "status": l.status,
-            "withdrawn_date": l.withdrawn_date,
-            "created_at": l.created_at,
-        }
-        for l in listings
-    ]
+    return [_listing_response_payload(l) for l in listings]
 
 
 @router.patch(
@@ -297,9 +426,16 @@ async def update_listing(
         allowed_fields = {
             "address",
             "postcode",
+            "region",
+            "county",
+            "property_number",
+            "title_number",
             "client_name",
             "status",
             "withdrawn_date",
+            "price",
+            "commission",
+            "contract_duration",
         }
 
         address_normalizer = AddressNormalizer()
@@ -321,15 +457,7 @@ async def update_listing(
         await db.commit()
         await db.refresh(listing)
 
-        return {
-            "id": listing.id,
-            "address": listing.address,
-            "postcode": listing.postcode,
-            "client_name": listing.client_name,
-            "status": listing.status,
-            "withdrawn_date": listing.withdrawn_date,
-            "created_at": listing.created_at,
-        }
+        return _listing_response_payload(listing)
 
     except HTTPException:
         raise

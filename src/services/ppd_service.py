@@ -6,9 +6,10 @@ using DuckDB for fraud detection.
 """
 
 import logging
-from datetime import timedelta
+import re
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import duckdb
 import pandas as pd
@@ -20,6 +21,44 @@ from src.services.address_normalizer import AddressNormalizer
 from src.utils.constants import config
 
 logger = logging.getLogger(__name__)
+
+# UK postcode pattern for fallback extraction from free-text address
+_UK_POSTCODE_RE = re.compile(
+    r"\b([A-Z]{1,2}\d[A-Z0-9]?\s*\d[A-Z]{2})\b", re.IGNORECASE
+)
+
+
+def _sql_literal(value: str) -> str:
+    """Escape a value for safe inclusion in a DuckDB SQL string literal."""
+    return (value or "").replace("'", "''")
+
+
+def _withdrawn_as_date(withdrawn) -> Optional[date]:
+    """Coerce listing withdrawn_date (date or datetime) to date for PPD windowing."""
+    if withdrawn is None:
+        return None
+    if isinstance(withdrawn, datetime):
+        return withdrawn.date()
+    if isinstance(withdrawn, date):
+        return withdrawn
+    return None
+
+
+def _effective_postcode(prop: PropertyListing) -> Optional[str]:
+    """Prefer stored postcode; otherwise try to parse from address."""
+    if prop.postcode and str(prop.postcode).strip():
+        return str(prop.postcode).strip()
+    if prop.address:
+        m = _UK_POSTCODE_RE.search(prop.address)
+        if m:
+            return re.sub(r"\s+", " ", m.group(1).upper()).strip()
+    return None
+
+
+def _postcode_prefix(postcode: str) -> str:
+    """First outward code segment for DuckDB LIKE filters."""
+    pc = postcode.strip().upper()
+    return pc.split()[0] if " " in pc else pc[:4]
 
 
 class IngestionSummary:
@@ -174,7 +213,8 @@ class PPDService:
 
         Filters by:
         - Date range (withdrawal_date to +scan_window_months)
-        - Postcode prefix (if available)
+        - Postcode prefix (from listing.postcode or parsed from address)
+        - Optional town / county overlap (from listing.region / listing.county)
 
         Args:
             properties: List of PropertyListing objects to match
@@ -189,27 +229,33 @@ class PPDService:
         scan_window = scan_window_months or config.SCAN_WINDOW_MONTHS
 
         # Build date range filter
-        min_date = None
-        max_date = None
-        postcodes = set()
+        min_date: Optional[date] = None
+        max_date: Optional[date] = None
+        postcodes: Set[str] = set()
+        towns: Set[str] = set()
+        counties: Set[str] = set()
+        props_without_date = 0
 
         for prop in properties:
-            if prop.withdrawn_date:
-                if min_date is None or prop.withdrawn_date < min_date:
-                    min_date = prop.withdrawn_date
+            wd = _withdrawn_as_date(prop.withdrawn_date)
+            if wd:
+                if min_date is None or wd < min_date:
+                    min_date = wd
 
-                end_date = prop.withdrawn_date + timedelta(days=scan_window * 30)
+                end_date = wd + timedelta(days=scan_window * 30)
                 if max_date is None or end_date > max_date:
                     max_date = end_date
+            else:
+                props_without_date += 1
 
-            if prop.postcode:
-                # Extract postcode prefix (first 2-4 characters)
-                prefix = (
-                    prop.postcode.split()[0]
-                    if " " in prop.postcode
-                    else prop.postcode[:4]
-                )
-                postcodes.add(prefix)
+            pc = _effective_postcode(prop)
+            if pc:
+                postcodes.add(_postcode_prefix(pc))
+
+            if getattr(prop, "region", None) and str(prop.region).strip():
+                towns.add(str(prop.region).strip())
+            if getattr(prop, "county", None) and str(prop.county).strip():
+                counties.add(str(prop.county).strip())
 
         # Build DuckDB query
         # Updated pattern for year-only partitioning
@@ -227,18 +273,60 @@ class PPDService:
                 AND transfer_date BETWEEN '{min_date.strftime("%Y-%m-%d")}'
                 AND '{max_date.strftime("%Y-%m-%d")}'
             """
+        else:
+            logger.warning(
+                "PPD query: no withdrawal dates on listings — omitting date filter "
+                "(scan may be broad). Listings missing date: %s",
+                props_without_date,
+            )
 
-        # Add postcode filter if we have postcodes
+        geo_clauses: List[str] = []
+
+        # Postcode filter (primary geographic narrowing)
         if postcodes:
             postcode_conditions = " OR ".join(
-                [f"postcode LIKE '{prefix}%'" for prefix in postcodes]
+                [f"postcode LIKE '{_sql_literal(p)}%'" for p in sorted(postcodes)]
             )
-            query += f" AND ({postcode_conditions})"
+            geo_clauses.append(f"({postcode_conditions})")
+
+        # Town / county hints from richer listing fields (helps when postcode is wrong/missing)
+        if towns:
+            town_parts = []
+            for t in towns:
+                lit = _sql_literal(t)
+                town_parts.append(
+                    f"(lower(town) LIKE lower('%{lit}%') "
+                    f"OR lower(locality) LIKE lower('%{lit}%'))"
+                )
+            geo_clauses.append("(" + " OR ".join(town_parts) + ")")
+
+        if counties:
+            county_parts = []
+            for c in counties:
+                lit = _sql_literal(c)
+                county_parts.append(
+                    f"(lower(county) LIKE lower('%{lit}%') "
+                    f"OR lower(district) LIKE lower('%{lit}%'))"
+                )
+            geo_clauses.append("(" + " OR ".join(county_parts) + ")")
+
+        if geo_clauses:
+            query += " AND (" + " OR ".join(geo_clauses) + ")"
 
         try:
-            logger.info(f"Executing DuckDB query: {query}")
+            logger.info(
+                "PPD DuckDB scan: listings=%s date_window=%s..%s postcode_prefixes=%s "
+                "towns=%s counties=%s",
+                len(properties),
+                min_date.isoformat() if min_date else None,
+                max_date.isoformat() if max_date else None,
+                sorted(postcodes) if postcodes else [],
+                list(towns) if towns else [],
+                list(counties) if counties else [],
+            )
+            logger.debug("PPD DuckDB SQL: %s", query)
             result_df = self.duckdb_conn.execute(query).fetchdf()
-            logger.info(f"Query returned {len(result_df)} PPD records")
+            logger.info("PPD query returned %s candidate row(s)", len(result_df))
             return result_df
         except Exception as e:
             logger.error(f"DuckDB query failed: {str(e)}")

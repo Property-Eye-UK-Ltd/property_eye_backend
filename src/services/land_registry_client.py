@@ -108,10 +108,22 @@ class LandRegistryClient:
         soap_body = self._build_oov_request_xml(request)
 
         try:
+            logger.info(
+                "HMLR OOV POST %s ref=%s soap_bytes=%s",
+                self._oov_path,
+                request.external_reference,
+                len(soap_body.encode("utf-8")),
+            )
             response = await self.client.post(
                 self._oov_path,
                 content=soap_body.encode("utf-8"),
                 headers={"Content-Type": "text/xml; charset=utf-8"},
+            )
+            logger.info(
+                "HMLR OOV HTTP status=%s ref=%s response_bytes=%s",
+                response.status_code,
+                request.external_reference,
+                len(response.content or b""),
             )
         except httpx.TimeoutException as exc:
             logger.error("Timeout calling HMLR OOV service: %s", exc)
@@ -145,23 +157,28 @@ class LandRegistryClient:
         expected_owner_name: str,
         message_id: Optional[str] = None,
         title_number: Optional[str] = None,
+        town: Optional[str] = None,
     ) -> OwnershipVerificationResult:
         """
         High-level ownership verification using OOV behind the scenes.
 
-        This method preserves the existing interface used by VerificationService
-        while delegating the actual check to the Online Owner Verification SOAP
-        service.
+        Pass title_number when known (OOV SubjectProperty by title); otherwise
+        property_address + postcode (+ optional town for CityName) are used.
         """
+        use_title = bool(title_number and str(title_number).strip())
         logger.info(
-            "Verifying ownership for %s, %s via OOV", property_address, postcode
+            "OOV verify_ownership mode=%s postcode_present=%s town_present=%s address_len=%s",
+            "title_number" if use_title else "address",
+            bool((postcode or "").strip()),
+            bool((town or "").strip()),
+            len((property_address or "").strip()),
         )
 
         # Enforce Land Registry input criteria only outside test mode.
         precheck_error = self._validate_request_prechecks(
             property_address=property_address,
             postcode=postcode,
-            title_number=title_number,
+            title_number=title_number if use_title else None,
         )
         if precheck_error and not self._is_test_mode:
             logger.warning(
@@ -183,13 +200,12 @@ class LandRegistryClient:
         address = OovAddress(
             building_name_or_number=building_part,
             street=street_part,
-            town=None,
+            town=(town.strip()[:35] if town and town.strip() else None),
             postcode=postcode or None,
         )
 
         if message_id:
             # Sanitise: Reference must be 1-25 chars, pattern [a-zA-Z0-9][a-zA-Z0-9\-]*
-            import re
             safe_id = re.sub(r"[^a-zA-Z0-9\-]", "-", message_id)[:25]
             # Strip leading non-alnum chars
             safe_id = re.sub(r"^[^a-zA-Z0-9]+", "", safe_id)
@@ -199,6 +215,8 @@ class LandRegistryClient:
         else:
             short_id = str(uuid.uuid4()).replace("-", "")[:22]
             ref = f"PE{short_id}"[:25]
+
+        clean_title = str(title_number).strip().upper() if use_title else None
 
         oov_request = OovRequest(
             external_reference=ref,
@@ -214,7 +232,7 @@ class LandRegistryClient:
             ),
             company_name=None,
             address=address,
-            title_number=title_number,
+            title_number=clean_title,
             historical_match=True,
             partial_match=True,
             highlight_additional_owners=True,
@@ -222,6 +240,12 @@ class LandRegistryClient:
 
         try:
             oov_response = await self.verify_owner(oov_request)
+            logger.info(
+                "OOV SOAP outcome ref=%s code=%s matches=%s",
+                ref,
+                oov_response.status_code,
+                len(oov_response.matches),
+            )
         except Exception as exc:
             logger.error("Unexpected error during OOV verification: %s", exc)
             return OwnershipVerificationResult(

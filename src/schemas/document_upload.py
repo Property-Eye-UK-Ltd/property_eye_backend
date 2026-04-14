@@ -1,43 +1,41 @@
-"""
-Document upload request and response schemas.
-"""
+"""Document ingestion request and response schemas."""
 
-from typing import Dict
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class DocumentUploadRequest(BaseModel):
-    """
-    Request schema for document upload.
-
-    Attributes:
-        agency_id: Unique identifier for the agency
-        field_mapping: Dictionary mapping agency columns to system fields
-    """
+class ListingsIngestRequest(BaseModel):
+    """Request schema for direct listings ingestion (JSON payload)."""
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "agency_id": "550e8400-e29b-41d4-a716-446655440000",
-                "field_mapping": {
-                    "Property Address": "address",
-                    "Client Full Name": "client_name",
-                    "Status": "status",
-                    "Date Withdrawn": "withdrawn_date",
-                    "Postcode": "postcode",
+                "rows": [
+                    [
+                        "11 Hamlet Hill, Roydon, Harlow, Essex, CM19 5LA",
+                        "£725,000",
+                        "17 January 2020",
+                        "John Smith",
+                    ]
+                ],
+                "record": {
+                    "address": "8 Woodstock, Brookfield Lane West, Cheshunt, Waltham Cross, Hertfordshire, EN8 0QH",
+                    "postcode": "EN8 0QH",
+                    "client_name": "Nina Baum",
+                    "withdrawn_date": "09/07/2022",
                 },
             }
         }
     )
 
-    agency_id: str = Field(
-        ...,
-        description="Unique identifier for the agency uploading the document",
+    rows: Optional[List[Any]] = Field(
+        default=None,
+        description="Optional nested list or list-of-dicts listing content",
     )
-    field_mapping: Dict[str, str] = Field(
-        ...,
-        description="Mapping of agency document columns to system field names",
+    record: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional single manual listing record",
     )
 
 

@@ -95,6 +95,8 @@ async def import_alto_properties(
             try:
                 # Extract address components
                 address_obj = prop_data.get("address", {})
+                alto_town = None
+                alto_county = None
                 if isinstance(address_obj, dict):
                     address_parts = [
                         address_obj.get("address_line_1", ""),
@@ -102,7 +104,15 @@ async def import_alto_properties(
                         address_obj.get("town", ""),
                     ]
                     full_address = ", ".join([p for p in address_parts if p])
-                    postcode = address_obj.get("postcode", "")
+                    postcode = address_obj.get("postcode", "") or ""
+                    tw = (address_obj.get("town") or "").strip()
+                    alto_town = tw or None
+                    co = (
+                        address_obj.get("county")
+                        or address_obj.get("county_name")
+                        or ""
+                    )
+                    alto_county = co.strip() or None
                 else:
                     # Fallback if address is a string
                     full_address = (
@@ -147,6 +157,8 @@ async def import_alto_properties(
                     address=full_address,
                     normalized_address=full_address.lower().strip(),
                     postcode=postcode,
+                    region=alto_town,
+                    county=alto_county,
                     client_name="Alto Import",  # Default since Alto doesn't provide client name
                     status=property_status,
                     withdrawn_date=None,  # Could parse from updated_at if status is withdrawn

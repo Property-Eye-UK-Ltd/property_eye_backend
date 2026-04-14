@@ -6,20 +6,48 @@ Processes suspicious matches through Land Registry API to confirm fraud cases.
 
 import json
 import logging
+import re
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.models.fraud_match import FraudMatch
+from src.models.property_listing import PropertyListing
 from src.schemas.verification import VerificationResult, VerificationSummary
 from src.services.address_normalizer import AddressNormalizer
 from src.services.land_registry_client import LandRegistryClient
 from src.utils.constants import config
 
 logger = logging.getLogger(__name__)
+
+_UK_POSTCODE_RE = re.compile(
+    r"\b([A-Z]{1,2}\d[A-Z0-9]?\s*\d[A-Z]{2})\b", re.IGNORECASE
+)
+
+
+def _effective_postcode_for_lr(listing: PropertyListing, ppd_postcode: str) -> str:
+    """Prefer agency postcode; else parse from address; else PPD match postcode."""
+    if listing.postcode and str(listing.postcode).strip():
+        return str(listing.postcode).strip()
+    if listing.address:
+        m = _UK_POSTCODE_RE.search(listing.address)
+        if m:
+            return re.sub(r"\s+", " ", m.group(1).upper()).strip()
+    return (ppd_postcode or "").strip()
+
+
+def _verification_street_address(listing: PropertyListing) -> str:
+    """Build free-form address for OOV (include property number when not in line)."""
+    base = listing.address or ""
+    pn = getattr(listing, "property_number", None)
+    if pn and str(pn).strip():
+        pns = str(pn).strip()
+        if pns.upper() not in base.upper():
+            return f"{pns} {base}".strip()
+    return base
 
 
 class VerificationService:
@@ -131,12 +159,48 @@ class VerificationService:
         property_listing = fraud_match.property_listing
 
         try:
-            # Call Land Registry API
+            title_no = (
+                (property_listing.title_number or "").strip()
+                if getattr(property_listing, "title_number", None)
+                else ""
+            )
+            verify_addr = _verification_street_address(property_listing)
+            verify_pc = _effective_postcode_for_lr(
+                property_listing, fraud_match.ppd_postcode or ""
+            )
+            town = (
+                (property_listing.region or "").strip()
+                if getattr(property_listing, "region", None)
+                else ""
+            ) or None
+
+            pc_src = (
+                "listing"
+                if (property_listing.postcode and str(property_listing.postcode).strip())
+                else (
+                    "parsed_address"
+                    if property_listing.address
+                    and _UK_POSTCODE_RE.search(property_listing.address)
+                    else "ppd_fallback"
+                )
+            )
+            logger.info(
+                "Verifying match %s: mode=%s listing_addr_len=%s postcode_source=%s town_set=%s",
+                match_id,
+                "title_number" if title_no else "address",
+                len(verify_addr or ""),
+                pc_src,
+                bool(town),
+            )
+
+            # Call Land Registry API (prefer listing + title; fall back to PPD address if empty)
             api_result = await self.land_registry_client.verify_ownership(
-                property_address=fraud_match.ppd_full_address,
-                postcode=fraud_match.ppd_postcode,
+                property_address=verify_addr or fraud_match.ppd_full_address,
+                postcode=verify_pc or fraud_match.ppd_postcode,
                 expected_owner_name=property_listing.client_name,
                 message_id=fraud_match.ppd_transaction_id,
+                title_number=title_no or None,
+                town=town,
             )
 
             # Store API response
