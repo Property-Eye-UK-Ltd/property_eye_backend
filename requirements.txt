@@ -34,6 +34,11 @@ pydantic-settings>=2.0.0
 python-jose[cryptography]>=3.3.0
 bcrypt>=4.1.2
 
+# AI column mapping agent
+langgraph>=0.2
+langchain-google-genai>=1.0
+langchain-core>=0.2
+
 # Testing
 pytest>=7.4.0
 pytest-asyncio>=0.23.0

@@ -8,13 +8,23 @@ import csv
 import json
 import re
 import sys
-import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import fitz  # PyMuPDF
 import pdfplumber
+
+# Cleaner helpers now live in extractor/cleaner.py; import back for backward compat.
+from lib.extractor.cleaner import (
+    finalize_row as _finalize_row,
+    sanitize_field as _sanitize_field,
+    scrub_cell_text as _scrub_cell_text,
+)
+
+
+class ImagePdfError(ValueError):
+    """Raised when the PDF appears to be a scanned image with no extractable text."""
 
 # --- Table detection (pdfplumber) ---
 MIN_TABLE_ROWS = 1
@@ -37,55 +47,6 @@ UK_POSTCODE_IN_TEXT = re.compile(
     re.IGNORECASE,
 )
 
-# Zero-width / soft hyphen / BOM often pasted from PDFs
-_JUNK_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\ufeff\u00ad\u2060]")
-# Curly quotes and stray ASCII quotes in numeric/text fields
-_SMART_QUOTES_RE = re.compile(r'[\u201c\u201d\u2018\u2019"\'`´]')
-
-
-def _scrub_cell_text(s: str) -> str:
-    """Normalize unicode, strip invisible chars, collapse whitespace and newlines."""
-    if not s:
-        return s
-    t = unicodedata.normalize("NFKC", s)
-    t = _JUNK_CHARS_RE.sub("", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def _normalize_price_text(s: str) -> str:
-    """Clean price strings: pound sign, spacing, line breaks, stray quotes."""
-    t = unicodedata.normalize("NFKC", s)
-    t = t.replace("\u00a3", "£").replace("GBP", "")
-    t = _JUNK_CHARS_RE.sub("", t)
-    t = _SMART_QUOTES_RE.sub("", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"\s*£\s*", "£", t)
-    return t.strip()
-
-
-def _sanitize_field(key: str, value: str) -> str:
-    """Apply field-specific cleaning for extracted string values."""
-    if key.lower() == "price":
-        return _normalize_price_text(value)
-    return _scrub_cell_text(value)
-
-
-def _finalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Scrub all string fields; refresh postcode from address when present."""
-    out: Dict[str, Any] = {}
-    for k, v in row.items():
-        out[k] = _sanitize_field(k, v) if isinstance(v, str) else v
-
-    addr = out.get("address")
-    if isinstance(addr, str) and addr.strip():
-        m = UK_POSTCODE_IN_TEXT.search(addr)
-        if m:
-            out["postcode"] = m.group(1).upper().replace("  ", " ").strip()
-
-    if isinstance(out.get("withdrawn_date"), str):
-        out["date"] = out["withdrawn_date"]
-    return out
 
 # Order matters: first matching pattern wins per cell (same idea as legacy extract_csv_from_pdf).
 FIELD_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
@@ -143,9 +104,20 @@ class PdfExtractOutcome:
     headers: List[str]
     rows: List[Dict[str, Any]]
     detail: str
+    # Raw column lists (pre-classification) fed to the AI column-mapper agent.
+    # Each inner list is one row; cells are cleaned strings in their original column order.
+    raw_rows: List[List[str]] = None  # type: ignore[assignment]
+    # Detected column header row (when the PDF contains an explicit header line).
+    header_row: Optional[List[str]] = None
+
+    def __post_init__(self) -> None:
+        if self.raw_rows is None:
+            self.raw_rows = []
 
     def to_dict(self) -> Dict[str, Any]:
-        return {**asdict(self), "rows": self.rows}
+        d = asdict(self)
+        d["rows"] = self.rows
+        return d
 
 
 def _matrix_to_clean_rows(matrix: Sequence[Sequence[Any]]) -> List[List[str]]:
@@ -178,6 +150,37 @@ def _row_looks_like_header(cells: List[str]) -> bool:
     if any(h in joined for h in header_hints):
         return True
     if all(len(c) <= 28 for c in cells if c) and cells:
+        return True
+    return False
+
+
+_FOOTER_PATTERNS = (
+    re.compile(r"^\s*page\s+\d+\s+of\s+\d+\s*$", re.IGNORECASE),
+    re.compile(r"^\s*\d+\s*$"),                              # bare page number
+    re.compile(r"^\s*printed\s+on\b", re.IGNORECASE),        # "Printed on DD/MM/YYYY"
+    re.compile(r"^\s*\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\s+\d{2}:\d{2}", re.IGNORECASE),  # timestamp
+    re.compile(r"^\s*(confidential|copyright|©|all rights reserved)", re.IGNORECASE),
+)
+
+_ADDRESS_FRAGMENT = re.compile(
+    r"\b(?:Road|Street|Lane|Drive|Close|Avenue|Way|Place|Crescent)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_footer_row(cells: List[str]) -> bool:
+    """True when the concatenated cell content looks like a page footer."""
+    joined = " ".join(c for c in cells if c).strip()
+    if not joined:
+        return False
+    # Never strip rows that contain address-like content
+    if _ADDRESS_FRAGMENT.search(joined):
+        return False
+    for pat in _FOOTER_PATTERNS:
+        if pat.match(joined):
+            return True
+    # Very short rows with no recognisable data (likely print artefacts)
+    if len(joined) < 40 and not re.search(r"[£\d]", joined):
         return True
     return False
 
@@ -230,9 +233,16 @@ def _classify_parts_to_row(parts: List[str]) -> Dict[str, Any]:
     return _finalize_row(row)
 
 
-def _regex_rows_from_text(full_text: str) -> List[Dict[str, Any]]:
-    """Scan text for quoted comma-separated chunks; classify each into a row dict."""
+def _regex_rows_from_text(
+    full_text: str,
+) -> tuple[List[Dict[str, Any]], List[List[str]]]:
+    """
+    Scan for quoted comma-separated chunks; return (classified_rows, raw_part_rows).
+    raw_part_rows preserves the original cell order for the AI column-mapper agent.
+    Footer rows are filtered out.
+    """
     rows: List[Dict[str, Any]] = []
+    raw_rows: List[List[str]] = []
     seen_spans: set = set()
 
     for m in QUOTED_CSV_CHUNK.finditer(full_text):
@@ -243,14 +253,17 @@ def _regex_rows_from_text(full_text: str) -> List[Dict[str, Any]]:
         parts = _extract_quoted_strings_from_chunk(chunk)
         if len(parts) < 2:
             continue
+        if _is_footer_row(parts):
+            continue
         row = _classify_parts_to_row(parts)
         if len(row) >= 3:
             rows.append(row)
+            raw_rows.append(parts)
             seen_spans.add(start)
         if len(rows) >= MAX_REGEX_ROWS:
             break
 
-    return rows
+    return rows, raw_rows
 
 
 def _pymupdf_full_text(pdf_path: str) -> str:
@@ -333,30 +346,38 @@ def _plumber_table_to_outcome(pnum: int, rows: List[List[str]]) -> PdfExtractOut
     norm = [r + [""] * (max_w - len(r)) for r in rows]
 
     if _row_looks_like_header(norm[0]):
-        headers = [c if c else f"column_{i + 1}" for i, c in enumerate(norm[0])]
-        data_rows = norm[1:]
-        dict_rows = _rows_to_dicts(headers, data_rows)
+        detected_header = [c if c else f"column_{i + 1}" for i, c in enumerate(norm[0])]
+        # Filter footer rows from data rows
+        data_rows = [r for r in norm[1:] if not _is_footer_row(r)]
+        dict_rows = _rows_to_dicts(detected_header, data_rows)
         return PdfExtractOutcome(
             "pdfplumber_table",
-            headers,
+            detected_header,
             dict_rows,
             f"Table on page {pnum}, header row detected, {len(dict_rows)} data rows",
+            raw_rows=data_rows,
+            header_row=detected_header,
         )
 
     dict_rows: List[Dict[str, Any]] = []
+    raw_rows: List[List[str]] = []
     for line_cells in norm:
         parts = [c for c in line_cells if c]
         if len(parts) < 2:
             continue
+        if _is_footer_row(parts):
+            continue
         row = _classify_parts_to_row(parts)
         if len(row) >= 3:
             dict_rows.append(row)
+            raw_rows.append(parts)
     field_keys = sorted({k for r in dict_rows for k in r.keys()})
     return PdfExtractOutcome(
         "pdfplumber_table",
         field_keys,
         dict_rows,
         f"Table on page {pnum}, headerless — regex-classified cells, {len(dict_rows)} rows",
+        raw_rows=raw_rows,
     )
 
 
@@ -421,11 +442,22 @@ def _extract_delimited_no_header(
     return headers, padded
 
 
+def _count_pdf_pages(pdf_path: str) -> int:
+    """Return the number of pages in the PDF without full parsing."""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
+
+
 def extract_from_pdf(pdf_path: str) -> PdfExtractOutcome:
     """
     1) pdfplumber table (with header row or headerless cell regex).
     2) PyMuPDF text + quoted-field regex rows (no headers).
     3) PyMuPDF delimiter lines, no header row (synthetic columns).
+
+    Raises ImagePdfError when the file has pages but no extractable text.
     """
     path = str(Path(pdf_path).resolve())
     if not Path(path).exists():
@@ -437,7 +469,7 @@ def extract_from_pdf(pdf_path: str) -> PdfExtractOutcome:
         return _plumber_table_to_outcome(pnum, rows)
 
     full_text = _pymupdf_full_text(path)
-    regex_rows = _regex_rows_from_text(full_text)
+    regex_rows, regex_raw = _regex_rows_from_text(full_text)
     if regex_rows:
         keys = sorted({k for r in regex_rows for k in r.keys()})
         return PdfExtractOutcome(
@@ -445,6 +477,7 @@ def extract_from_pdf(pdf_path: str) -> PdfExtractOutcome:
             keys,
             regex_rows,
             f"Headerless quoted fields + regex, {len(regex_rows)} rows",
+            raw_rows=regex_raw,
         )
 
     delim_hit = _extract_delimited_no_header(full_text)
@@ -456,6 +489,17 @@ def extract_from_pdf(pdf_path: str) -> PdfExtractOutcome:
             headers,
             dict_rows,
             f"Delimiter lines, synthetic headers, {len(dict_rows)} rows",
+            raw_rows=data_rows,
+        )
+
+    # Nothing extracted — check whether the file is a scanned image PDF
+    n_pages = _count_pdf_pages(path)
+    char_count = len(full_text.strip())
+    if n_pages > 0 and char_count < 50 * n_pages:
+        raise ImagePdfError(
+            f"PDF has {n_pages} page(s) but only {char_count} characters of text could be "
+            "extracted. This appears to be a scanned image PDF. Please provide a "
+            "text-based PDF or convert the scan to text first."
         )
 
     return PdfExtractOutcome(

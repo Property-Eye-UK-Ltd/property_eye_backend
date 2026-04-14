@@ -1,0 +1,426 @@
+# ai_agent.py — LangGraph reflection agent for AI-powered column mapping.
+#
+# Two-node graph:   extractor → reviewer → (approved | retry → extractor)
+#
+# Only a single sample row + optional context row is ever sent to the model.
+# All private listing data stays local.
+#
+# Two prompt modes:
+#   header_mode — the file has real column header names (CSV or PDF with header row).
+#                 The AI just name-matches; much cleaner and more reliable.
+#   data_mode   — no header row; the AI infers from cell content.
+#                 An optional context_row (with continuation hint) provides extra signal.
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Annotated, Any, Dict, List, Optional
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
+
+# ---------------------------------------------------------------------------
+# DSL reference — injected into every extractor prompt
+# ---------------------------------------------------------------------------
+
+_DSL_REFERENCE = """
+COLUMN MAP DSL
+==============
+Return a single JSON object where each key is a canonical field name and the
+value is one of:
+
+  "N"      — Use the cell at index N (0-based) verbatim.
+  "N+M"    — Concatenate cells at indices N and M with a space (e.g. first + last name,
+             or town + county that are split across columns).
+  ">N"     — The canonical value is *embedded inside* cell N; the system will
+             regex-extract it automatically.  Use for:
+               - postcode hidden at the end of a full address string
+               - date embedded in a description field
+               - price buried inside a narrative cell (e.g. "Offers in excess of £670,000")
+  "N?"     — Same as "N" but you are UNCERTAIN about this mapping; the system will
+             flag the extracted value as low-confidence for human review.
+             Use "N?" when a cell plausibly contains the field but you are not sure.
+  null     — Field is not present in this data source.
+
+Canonical fields (use exactly these keys):
+  address           — Full property address (street number, name, town, postcode)
+  postcode          — UK postcode (e.g. EN10 7DA).  Use ">N" when embedded in address.
+  region            — Town or city.  Use ">N" when embedded in address, or "N+M" if split.
+  county            — County (e.g. Hertfordshire, Essex).  Use ">N" when embedded in address.
+  withdrawn_date    — Date the property was withdrawn from the market.
+  price             — Listing price.  Use ">N" when the cell contains narrative.
+  commission        — Agent commission.  Patterns to detect:
+                        "1.5%", "1.75% + VAT", "£3,000 flat fee",
+                        "Sole Agency 1.25%", "Multi Agency 2%".
+                      Map the cell containing a percentage near a currency symbol or
+                      near the word "agency" / "commission".  Return null if absent.
+  client_name       — Property owner / vendor full name.  Use "N+M" if split across cells.
+  contract_duration — Length of the agency contract (e.g. "12 weeks", "3 months").
+  property_number   — House or flat number only (e.g. "11", "Flat 3").
+
+Rules (STRICT — the reviewer will reject violations):
+1. Use ">N" — NOT a bare "N" — whenever the canonical value is only a PART of the cell.
+   Examples where ">N" is REQUIRED:
+     • postcode is the last token of a full address string  →  ">0", not "0"
+     • price is inside "Offers in excess of £670,000"       →  ">2", not "2"
+     • region / county are embedded inside the address      →  ">0", not separate indices
+2. Use "N+M" only when the cells are separate columns that should be joined.
+3. Use "N?" when you are guessing; never silently map a dubious cell without "?".
+4. Output ONLY valid JSON — no markdown fences, no explanation outside the JSON.
+"""
+
+# ---------------------------------------------------------------------------
+# Concrete one-shot examples — appended to each extractor system prompt
+# ---------------------------------------------------------------------------
+
+_EXAMPLE_DATA_MODE = """
+─── WORKED EXAMPLE (data mode) ───────────────────────────────────────────────
+Input row:
+  [0] '11 Hamlet Hill, Roydon, Harlow, Essex, CM19 5LA'
+  [1] 'House'
+  [2] 'Offers in excess of £725,000'
+  [3] '17 January 2020'
+  [4] 'Withdrawn'
+  [5] 'Sole Agency 1.5%'
+
+Correct output:
+{
+  "address": "0",
+  "postcode": ">0",
+  "region": ">0",
+  "county": ">0",
+  "property_number": ">0",
+  "property_type": "1",
+  "price": ">2",
+  "withdrawn_date": "3",
+  "status": "4",
+  "commission": "5",
+  "client_name": null,
+  "contract_duration": null
+}
+
+Note: postcode/region/county all use ">0" because they are substrings of cell 0.
+      price uses ">2" because the amount is buried inside narrative text.
+──────────────────────────────────────────────────────────────────────────────
+"""
+
+_EXAMPLE_HEADER_MODE = """
+─── WORKED EXAMPLE (header mode) ─────────────────────────────────────────────
+Column headers:
+  [0] 'Property Address'
+  [1] 'Property Type'
+  [2] 'Asking Price'
+  [3] 'Date Withdrawn'
+  [4] 'Status'
+  [5] 'Vendor Name'
+  [6] 'Commission'
+
+Correct output:
+{
+  "address": "0",
+  "postcode": ">0",
+  "region": ">0",
+  "county": ">0",
+  "property_number": ">0",
+  "property_type": "1",
+  "price": "2",
+  "withdrawn_date": "3",
+  "status": "4",
+  "client_name": "5",
+  "commission": "6",
+  "contract_duration": null
+}
+
+Note: 'Property Address' header implies the column holds a full address string, so
+      postcode/region/county all use ">0".  Dedicated columns like 'Asking Price'
+      use a bare index because the cell will contain just the value.
+──────────────────────────────────────────────────────────────────────────────
+"""
+
+# ---------------------------------------------------------------------------
+# System messages
+# ---------------------------------------------------------------------------
+
+_EXTRACTOR_SYSTEM_HEADER = SystemMessage(
+    content=(
+        "You are a precise data schema analyst specialised in UK estate agent file formats. "
+        "The user will provide a list of column header names taken directly from a CSV or PDF. "
+        "Your job is to map each header (by its index) to the canonical field it represents, "
+        "using the DSL format below.\n\n"
+        "Because these are actual column headers, prefer direct index mapping ('N'). "
+        "Only use '>N' if the header name implies its value contains another canonical field "
+        "(e.g. a header called 'Full Address' which would embed the postcode).\n\n"
+        + _DSL_REFERENCE
+        + _EXAMPLE_HEADER_MODE
+    )
+)
+
+_EXTRACTOR_SYSTEM_DATA = SystemMessage(
+    content=(
+        "You are a precise data schema analyst specialised in messy UK estate agent exports. "
+        "The user will provide a sample data row (and optionally a context row) extracted from "
+        "a PDF. Infer which cell holds which canonical field from the cell content itself.\n\n"
+        + _DSL_REFERENCE
+        + _EXAMPLE_DATA_MODE
+    )
+)
+
+_REVIEWER_SYSTEM = SystemMessage(
+    content=(
+        "You are a meticulous schema auditor. You receive a sample row and a proposed column "
+        "map. Verify the mapping is correct by checking:\n"
+        "  1. Every non-null index is within bounds for the row.\n"
+        "  2. The cell content at each index is plausible for the declared field type.\n"
+        "  3. CRITICAL — '>N' enforcement: if a canonical field's value is only a SUBSTRING of "
+        "a cell (e.g. postcode at the end of a full address, or price inside narrative text), "
+        "the mapping MUST use '>N', not a bare 'N'.  Reject any mapping where:\n"
+        "     • postcode is mapped as a bare index 'N' but the cell also contains street name / town\n"
+        "     • price is mapped as a bare index 'N' but the cell contains words like 'Offers', "
+        "'in excess of', 'Guide price', 'OIEO', 'POA'\n"
+        "     • region or county is mapped as a bare index 'N' but the cell is a full address string\n"
+        "  4. No field is obviously mapped to the wrong cell (e.g. a date index for price).\n"
+        "  5. commission is null only when no percentage or flat-fee pattern exists anywhere in "
+        "the row.\n"
+        "  6. If the extractor used 'N?' (uncertain flag), verify whether the uncertainty is "
+        "justified; if the cell is clearly correct, suggest removing the '?'.\n\n"
+        "Respond with ONLY valid JSON in one of two forms:\n"
+        '  { "approved": true }\n'
+        '  { "approved": false, "critique": "<specific actionable feedback>" }'
+    )
+)
+
+MAX_ITERATIONS = 3
+
+
+# ---------------------------------------------------------------------------
+# LangGraph state
+# ---------------------------------------------------------------------------
+
+
+class AgentState(TypedDict):
+    """Mutable state threaded through the LangGraph nodes."""
+
+    messages: Annotated[List[Any], add_messages]
+    last_mapping: Optional[Dict[str, Any]]
+    iteration: int
+    approved: bool
+    # Primary sample row (best scored or first data row)
+    sample_row: List[str]
+    # Optional context: the row immediately after sample_row
+    context_row: Optional[List[str]]
+    # True when context_row looks like an overflow of sample_row
+    is_continuation: bool
+    # Real column headers (CSV or PDF header row) — triggers header_mode prompting
+    header_row: Optional[List[str]]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_default_model():
+    """Construct the default Gemini Flash model; raises if key not set."""
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+    except ImportError as exc:
+        raise ImportError(
+            "langchain-google-genai is required. "
+            "Run: pip install langchain-google-genai"
+        ) from exc
+
+    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    if not api_key:
+        raise EnvironmentError(
+            "GOOGLE_API_KEY is not set. Add it to .env or the environment."
+        )
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-lite",
+        google_api_key=api_key,
+        temperature=0,
+    )
+
+
+def _parse_json_from_response(text: str) -> Dict[str, Any]:
+    """Extract a JSON object from model output, stripping markdown fences if present."""
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
+
+
+def _format_indexed_list(items: List[str], label: str = "cell") -> str:
+    """Format a list as a numbered indexed block for the prompt."""
+    lines = [f"  [{i}] {item!r}" for i, item in enumerate(items)]
+    return f"{label} list ({len(items)} items):\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Graph nodes
+# ---------------------------------------------------------------------------
+
+
+def _extractor_node(state: AgentState, model) -> Dict[str, Any]:
+    """Produce a DSL column mapping for the sample (or header) row."""
+    header_row = state.get("header_row")
+    sample_row = state["sample_row"]
+    context_row = state.get("context_row")
+    is_continuation = state.get("is_continuation", False)
+    history = state.get("messages", [])
+
+    if header_row:
+        # --- Header mode: map header names to canonical fields ---
+        system_msg = _EXTRACTOR_SYSTEM_HEADER
+        user_content = (
+            "These are the actual column headers from the file:\n"
+            + _format_indexed_list(header_row, "header")
+            + "\n\nFor reference, here is the first data row:\n"
+            + _format_indexed_list(sample_row, "data row")
+        )
+    else:
+        # --- Data mode: infer from cell content ---
+        system_msg = _EXTRACTOR_SYSTEM_DATA
+        user_content = "Primary sample row:\n" + _format_indexed_list(
+            sample_row, "primary row"
+        )
+        if context_row:
+            cont_label = (
+                "CONTINUATION of the primary row (overflow cells)"
+                if is_continuation
+                else "NEW record (separate property)"
+            )
+            user_content += (
+                f"\n\nContext row immediately following the primary row "
+                f"[{cont_label}]:\n"
+                + _format_indexed_list(context_row, "context row")
+                + "\n\nUse context row cells only if the primary row is missing a field you need."
+            )
+
+    # Attach previous critique on retry iterations
+    if state["iteration"] > 0:
+        last_critique = next(
+            (
+                m.content
+                for m in reversed(history)
+                if isinstance(m, AIMessage) and "critique" in m.content
+            ),
+            None,
+        )
+        if last_critique:
+            user_content += (
+                f"\n\nYour previous attempt was rejected:\n{last_critique}"
+                "\n\nPlease fix the mapping accordingly."
+            )
+
+    response = model.invoke([system_msg, HumanMessage(content=user_content)])
+
+    try:
+        mapping = _parse_json_from_response(response.content)
+    except (json.JSONDecodeError, ValueError):
+        mapping = state.get("last_mapping") or {}
+
+    return {
+        "messages": [response],
+        "last_mapping": mapping,
+        "iteration": state["iteration"] + 1,
+    }
+
+
+def _reviewer_node(state: AgentState, model) -> Dict[str, Any]:
+    """Validate the latest mapping; approve or return a critique."""
+    sample_row = state["sample_row"]
+    header_row = state.get("header_row")
+    mapping_text = json.dumps(state.get("last_mapping", {}), indent=2)
+
+    if header_row:
+        row_text = (
+            "Column headers:\n"
+            + _format_indexed_list(header_row, "header")
+            + "\n\nFirst data row (for content verification):\n"
+            + _format_indexed_list(sample_row, "data row")
+        )
+    else:
+        row_text = _format_indexed_list(sample_row, "primary row")
+
+    user_content = f"{row_text}\n\nProposed column map:\n{mapping_text}"
+    response = model.invoke([_REVIEWER_SYSTEM, HumanMessage(content=user_content)])
+
+    try:
+        verdict = _parse_json_from_response(response.content)
+        approved = bool(verdict.get("approved", False))
+    except (json.JSONDecodeError, ValueError):
+        approved = True  # malformed verdict → accept current mapping
+
+    return {"messages": [response], "approved": approved}
+
+
+def _should_continue(state: AgentState) -> str:
+    """Route back to extractor for another attempt, or finish."""
+    if state.get("approved") or state["iteration"] >= MAX_ITERATIONS:
+        return END
+    return "extractor"
+
+
+# ---------------------------------------------------------------------------
+# Graph factory
+# ---------------------------------------------------------------------------
+
+
+def build_agent(model=None):
+    """
+    Build and compile the reflection graph.
+
+    Args:
+        model: Any LangChain chat model. Defaults to gemini-1.5-flash.
+    """
+    if model is None:
+        model = _build_default_model()
+
+    graph = StateGraph(AgentState)
+    graph.add_node("extractor", lambda s: _extractor_node(s, model))
+    graph.add_node("reviewer", lambda s: _reviewer_node(s, model))
+    graph.set_entry_point("extractor")
+    graph.add_edge("extractor", "reviewer")
+    graph.add_conditional_edges("reviewer", _should_continue)
+    return graph.compile()
+
+
+def run_agent(
+    sample_row: List[str],
+    context_row: Optional[List[str]] = None,
+    is_continuation: bool = False,
+    header_row: Optional[List[str]] = None,
+    model=None,
+) -> Dict[str, Any]:
+    """
+    Run the reflection agent on a sample row.
+
+    Args:
+        sample_row:     Best data row (or first data row for CSV).
+        context_row:    Row immediately following sample_row (optional extra context).
+        is_continuation: True when context_row appears to be an overflow of sample_row.
+        header_row:     Real column header names when available (activates header-mode).
+        model:          Optional LangChain chat model override.
+
+    Returns:
+        DSL column-map dict (canonical_field → instruction | null).
+    """
+    app = build_agent(model)
+
+    initial_state: AgentState = {
+        "messages": [],
+        "last_mapping": None,
+        "iteration": 0,
+        "approved": False,
+        "sample_row": sample_row,
+        "context_row": context_row,
+        "is_continuation": is_continuation,
+        "header_row": header_row,
+    }
+
+    final_state = app.invoke(initial_state)
+    return final_state.get("last_mapping") or {}
