@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Annotated, Any, Dict, List, Optional
@@ -22,6 +23,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # DSL reference — injected into every extractor prompt
@@ -61,6 +64,11 @@ Canonical fields (use exactly these keys):
   client_name       — Property owner / vendor full name.  Use "N+M" if split across cells.
   contract_duration — Length of the agency contract (e.g. "12 weeks", "3 months").
   property_number   — House or flat number only (e.g. "11", "Flat 3").
+  title_number      — HM Land Registry title number (2–3 uppercase district letters followed by
+                     1–6 digits, e.g. "HD567890", "TGL12345", "AMS1234").  Most agencies do NOT
+                     record this.  Return null unless a column clearly contains this pattern.
+                     Use ">N" if the title number appears embedded inside a reference or notes
+                     field alongside other text.
 
 Rules (STRICT — the reviewer will reject violations):
 1. Use ">N" — NOT a bare "N" — whenever the canonical value is only a PART of the cell.
@@ -86,6 +94,8 @@ Input row:
   [3] '17 January 2020'
   [4] 'Withdrawn'
   [5] 'Sole Agency 1.5%'
+  [6] 'John Smith'
+  [7] 'HD567890'
 
 Correct output:
 {
@@ -94,17 +104,18 @@ Correct output:
   "region": ">0",
   "county": ">0",
   "property_number": ">0",
-  "property_type": "1",
   "price": ">2",
   "withdrawn_date": "3",
-  "status": "4",
   "commission": "5",
-  "client_name": null,
+  "client_name": "6",
+  "title_number": "7",
   "contract_duration": null
 }
 
 Note: postcode/region/county all use ">0" because they are substrings of cell 0.
       price uses ">2" because the amount is buried inside narrative text.
+      title_number uses "7" because cell 7 is a dedicated HMLR title number (HD567890).
+      Use ">N" for title_number only if the HMLR code is embedded inside a larger notes field.
 ──────────────────────────────────────────────────────────────────────────────
 """
 
@@ -118,6 +129,7 @@ Column headers:
   [4] 'Status'
   [5] 'Vendor Name'
   [6] 'Commission'
+  [7] 'Title Number'
 
 Correct output:
 {
@@ -126,18 +138,18 @@ Correct output:
   "region": ">0",
   "county": ">0",
   "property_number": ">0",
-  "property_type": "1",
   "price": "2",
   "withdrawn_date": "3",
-  "status": "4",
   "client_name": "5",
   "commission": "6",
+  "title_number": "7",
   "contract_duration": null
 }
 
 Note: 'Property Address' header implies the column holds a full address string, so
       postcode/region/county all use ">0".  Dedicated columns like 'Asking Price'
       use a bare index because the cell will contain just the value.
+      title_number maps to "7" because the header is explicitly named 'Title Number'.
 ──────────────────────────────────────────────────────────────────────────────
 """
 
@@ -223,25 +235,73 @@ class AgentState(TypedDict):
 # ---------------------------------------------------------------------------
 
 
-def _build_default_model():
-    """Construct the default Gemini Flash model; raises if key not set."""
+# Build a Gemini chat model from environment config.
+def _build_gemini_model(model_name: str):
+    """Construct a Gemini model instance and validate required key."""
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
     except ImportError as exc:
         raise ImportError(
-            "langchain-google-genai is required. "
+            "langchain-google-genai is required for Gemini. "
             "Run: pip install langchain-google-genai"
         ) from exc
 
     api_key = os.environ.get("GOOGLE_API_KEY", "")
     if not api_key:
+        logger.error("GOOGLE_API_KEY is missing from environment")
         raise EnvironmentError(
             "GOOGLE_API_KEY is not set. Add it to .env or the environment."
         )
+    logger.info("Building Gemini model (%s)", model_name)
     return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite",
+        model=model_name,
         google_api_key=api_key,
         temperature=0,
+    )
+
+
+# Build a Groq chat model from environment config.
+def _build_groq_model(model_name: str):
+    """Construct a Groq model instance and validate required key."""
+    try:
+        from langchain_groq import ChatGroq
+    except ImportError as exc:
+        raise ImportError(
+            "langchain-groq is required for Groq. Run: pip install langchain-groq"
+        ) from exc
+
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        logger.error("GROQ_API_KEY is missing from environment")
+        raise EnvironmentError(
+            "GROQ_API_KEY is not set. Add it to .env or the environment."
+        )
+    logger.info("Building Groq model (%s)", model_name)
+    return ChatGroq(
+        model=model_name,
+        api_key=api_key,
+        temperature=0,
+    )
+
+
+# Resolve provider and model from env, then build the chat model.
+def _build_default_model():
+    """Construct the default provider model based on environment variables."""
+    provider = os.environ.get("EXTRACTOR_LLM_PROVIDER", "gemini").strip().lower()
+    model_name = os.environ.get("EXTRACTOR_LLM_MODEL", "").strip()
+
+    if provider == "gemini":
+        resolved_model = model_name or "gemini-2.5-flash-lite"
+        return _build_gemini_model(resolved_model)
+
+    if provider == "groq":
+        resolved_model = model_name or "llama-3.1-8b-instant"
+        return _build_groq_model(resolved_model)
+
+    supported = "gemini, groq"
+    logger.error("Unsupported EXTRACTOR_LLM_PROVIDER value: %s", provider)
+    raise EnvironmentError(
+        f"Unsupported EXTRACTOR_LLM_PROVIDER='{provider}'. Supported values: {supported}."
     )
 
 
@@ -271,6 +331,14 @@ def _extractor_node(state: AgentState, model) -> Dict[str, Any]:
     context_row = state.get("context_row")
     is_continuation = state.get("is_continuation", False)
     history = state.get("messages", [])
+    logger.info(
+        "Extractor node iteration=%s header_mode=%s sample_cells=%s context_present=%s continuation=%s",
+        state.get("iteration", 0),
+        bool(header_row),
+        len(sample_row),
+        context_row is not None,
+        is_continuation,
+    )
 
     if header_row:
         # --- Header mode: map header names to canonical fields ---
@@ -317,10 +385,23 @@ def _extractor_node(state: AgentState, model) -> Dict[str, Any]:
             )
 
     response = model.invoke([system_msg, HumanMessage(content=user_content)])
+    # Log the extractor node's full model response so reviewer interaction is observable.
+    logger.info(
+        "Extractor output (iteration=%s): %s",
+        state.get("iteration", 0),
+        str(response.content),
+    )
 
     try:
         mapping = _parse_json_from_response(response.content)
+        logger.info("Extractor parsed mapping successfully")
+        # logger.info(
+        #     "Extractor parsed mapping JSON: %s", json.dumps(mapping, ensure_ascii=False)
+        # )
     except (json.JSONDecodeError, ValueError):
+        logger.exception(
+            "Extractor returned invalid JSON; reusing previous mapping if present"
+        )
         mapping = state.get("last_mapping") or {}
 
     return {
@@ -347,12 +428,28 @@ def _reviewer_node(state: AgentState, model) -> Dict[str, Any]:
         row_text = _format_indexed_list(sample_row, "primary row")
 
     user_content = f"{row_text}\n\nProposed column map:\n{mapping_text}"
+    logger.info(
+        "Reviewer node started iteration=%s mapping_keys=%s",
+        state.get("iteration", 0),
+        len((state.get("last_mapping") or {}).keys()),
+    )
     response = model.invoke([_REVIEWER_SYSTEM, HumanMessage(content=user_content)])
+    # Log the reviewer node's full model response for reflection transparency.
+    logger.info(
+        "Reviewer output (iteration=%s): %s",
+        state.get("iteration", 0),
+        str(response.content),
+    )
 
     try:
         verdict = _parse_json_from_response(response.content)
         approved = bool(verdict.get("approved", False))
+        logger.info("Reviewer verdict parsed approved=%s", approved)
+        # logger.info(
+        #     "Reviewer parsed verdict JSON: %s", json.dumps(verdict, ensure_ascii=False)
+        # )
     except (json.JSONDecodeError, ValueError):
+        logger.exception("Reviewer returned invalid JSON; defaulting to approved=True")
         approved = True  # malformed verdict → accept current mapping
 
     return {"messages": [response], "approved": approved}
@@ -361,7 +458,16 @@ def _reviewer_node(state: AgentState, model) -> Dict[str, Any]:
 def _should_continue(state: AgentState) -> str:
     """Route back to extractor for another attempt, or finish."""
     if state.get("approved") or state["iteration"] >= MAX_ITERATIONS:
+        logger.info(
+            "Reflection loop ended approved=%s iteration=%s max=%s",
+            state.get("approved", False),
+            state["iteration"],
+            MAX_ITERATIONS,
+        )
         return END
+    logger.info(
+        "Reflection loop continuing to extractor iteration=%s", state["iteration"]
+    )
     return "extractor"
 
 
@@ -375,9 +481,10 @@ def build_agent(model=None):
     Build and compile the reflection graph.
 
     Args:
-        model: Any LangChain chat model. Defaults to gemini-1.5-flash.
+        model: Any LangChain chat model. Defaults to env-selected provider/model.
     """
     if model is None:
+        logger.info("No model override provided; constructing default model")
         model = _build_default_model()
 
     graph = StateGraph(AgentState)
@@ -409,6 +516,13 @@ def run_agent(
     Returns:
         DSL column-map dict (canonical_field → instruction | null).
     """
+    logger.info(
+        "run_agent called sample_cells=%s context_present=%s continuation=%s header_mode=%s",
+        len(sample_row),
+        context_row is not None,
+        is_continuation,
+        bool(header_row),
+    )
     app = build_agent(model)
 
     initial_state: AgentState = {
@@ -422,5 +536,15 @@ def run_agent(
         "header_row": header_row,
     }
 
-    final_state = app.invoke(initial_state)
+    try:
+        final_state = app.invoke(initial_state)
+    except Exception:
+        logger.exception("LangGraph invocation failed during run_agent")
+        raise
+    logger.info(
+        "run_agent completed approved=%s iterations=%s mapping_keys=%s",
+        final_state.get("approved"),
+        final_state.get("iteration"),
+        len((final_state.get("last_mapping") or {}).keys()),
+    )
     return final_state.get("last_mapping") or {}

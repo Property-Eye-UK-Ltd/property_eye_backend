@@ -17,23 +17,35 @@ _UK_POSTCODE = re.compile(
 )
 
 _DATE_LONG_MONTH = re.compile(
-    r"\b(\d{1,2}\s+"
-    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
-    r"\s+\d{4})\b",
+    r"\b(\d{1,2})\s+"
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(\d{4})\b",
     re.IGNORECASE,
 )
-_DATE_ISO = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-_DATE_SLASH = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
-_DATE_DOT = re.compile(r"\b(\d{1,2}\.\d{1,2}\.\d{2,4})\b")
+_DATE_ISO = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_DATE_SLASH = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b")
+_DATE_DOT = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})\b")
 
-_PRICE = re.compile(r"[\u00a3£]([\d,]+(?:\.\d{1,2})?)")
+# Matches price amounts with optional pence — allows no-space before £
+_PRICE = re.compile(r"[\u00a3£]\s*([\d,]+(?:\.\d{1,2})?)")
 _COMMISSION_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
-_COMMISSION_AMT = re.compile(r"[\u00a3£]([\d,]+(?:\.\d{1,2})?)")
+_COMMISSION_AMT = re.compile(r"[\u00a3£]\s*([\d,]+(?:\.\d{1,2})?)")
 
 _PROPERTY_NUMBER = re.compile(
     r"(?:(?:Flat|Apt|Unit|Plot|No\.?)\s*)?(\d+[A-Za-z]?)\b",
     re.IGNORECASE,
 )
+
+# HMLR title number: 2–3 uppercase district letters + 1–6 digits (e.g. HD567890, TGL12345)
+# Must be word-bounded to avoid matching partial strings inside larger codes.
+_TITLE_NUMBER = re.compile(r"\b([A-Z]{2,3}\d{1,6})\b")
+
+# Month name → number mapping for long-form date conversion
+_MONTH_MAP = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
 
 # UK county names (top-level list for heuristic extraction from address segments)
 _KNOWN_COUNTIES = {
@@ -46,25 +58,60 @@ _KNOWN_COUNTIES = {
 }
 
 
+def _normalise_year(year_str: str) -> int:
+    """Convert 2-digit year to 4-digit (assumes 2000s)."""
+    y = int(year_str)
+    return y + 2000 if y < 100 else y
+
+
+def _to_dmy(day: int, month: int, year: int) -> str:
+    """Format as DD/MM/YYYY."""
+    return f"{day:02d}/{month:02d}/{year:04d}"
+
+
 def extract_postcode(text: str) -> Optional[str]:
     """Extract and normalize the first UK postcode found in text."""
     m = _UK_POSTCODE.search(text)
     if not m:
         return None
-    return m.group(1).upper().replace("  ", " ").strip()
+    return re.sub(r"\s+", " ", m.group(1).upper()).strip()
 
 
 def extract_date(text: str) -> Optional[str]:
-    """Return the first recognisable date string in the cell."""
-    for pattern in (_DATE_LONG_MONTH, _DATE_ISO, _DATE_SLASH, _DATE_DOT):
-        m = pattern.search(text)
-        if m:
-            return scrub_cell_text(m.group(1))
+    """Return the first recognisable date, normalized to DD/MM/YYYY."""
+    # "17 January 2020" style
+    m = _DATE_LONG_MONTH.search(text)
+    if m:
+        day = int(m.group(1))
+        month = _MONTH_MAP[m.group(2).lower()]
+        year = int(m.group(3))
+        return _to_dmy(day, month, year)
+
+    # "2020-01-17" ISO style
+    m = _DATE_ISO.search(text)
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return _to_dmy(day, month, year)
+
+    # "17/01/2020" or "17/01/20" slash style
+    m = _DATE_SLASH.search(text)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = _normalise_year(m.group(3))
+        return _to_dmy(day, month, year)
+
+    # "17.01.2020" dot style
+    m = _DATE_DOT.search(text)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = _normalise_year(m.group(3))
+        return _to_dmy(day, month, year)
+
     return None
 
 
 def extract_price(text: str) -> Optional[str]:
-    """Extract a monetary amount as a clean '£X,XXX' string."""
+    """Extract only the monetary amount as '£X,XXX', stripping any surrounding narrative."""
     cleaned = normalize_price_text(text)
     m = _PRICE.search(cleaned)
     if m:
@@ -100,7 +147,6 @@ def extract_county(text: str) -> Optional[str]:
 def extract_region(text: str) -> Optional[str]:
     """Return the town/city segment (second-to-last non-postcode comma-segment)."""
     segments = [s.strip() for s in text.split(",") if s.strip()]
-    # Drop any trailing postcode segment
     cleaned = [s for s in segments if not _UK_POSTCODE.fullmatch(s)]
     if len(cleaned) >= 2:
         return cleaned[-2]
@@ -112,6 +158,16 @@ def extract_region(text: str) -> Optional[str]:
 def extract_property_number(text: str) -> Optional[str]:
     """Extract a house/flat/plot number from address text."""
     m = _PROPERTY_NUMBER.search(text)
+    return m.group(1) if m else None
+
+
+def extract_title_number(text: str) -> Optional[str]:
+    """
+    Extract an HMLR title number (2–3 district letters + 1–6 digits, e.g. HD567890).
+    Returns the value uppercased and stripped; None if no valid pattern found.
+    """
+    cleaned = scrub_cell_text(text).upper()
+    m = _TITLE_NUMBER.search(cleaned)
     return m.group(1) if m else None
 
 
@@ -129,6 +185,7 @@ _DISPATCHER = {
     "county": extract_county,
     "region": extract_region,
     "property_number": extract_property_number,
+    "title_number": extract_title_number,
 }
 
 

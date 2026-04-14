@@ -15,6 +15,21 @@ from typing import Any, Dict, List, Optional, Tuple
 from .cleaner import finalize_row, scrub_cell_text
 from .field_extractors import extract_field
 
+# All canonical output fields — every row will include each key, value or None.
+CANONICAL_FIELDS: List[str] = [
+    "address",
+    "postcode",
+    "region",
+    "county",
+    "property_number",
+    "withdrawn_date",
+    "price",
+    "commission",
+    "client_name",
+    "contract_duration",
+    "title_number",
+]
+
 # Pattern that validates a DSL value token (optional trailing '?' for uncertainty)
 _DIRECT_RE = re.compile(r"^(\d+)\??$")
 _CONCAT_RE = re.compile(r"^(\d+)(\+\d+)+$")
@@ -106,7 +121,14 @@ def interpret(
             if uncertain:
                 result[f"{field}_uncertain"] = True
 
-    return finalize_row(result)
+    finalized = finalize_row(result)
+
+    # Ensure every canonical field is present — set to None when absent or unmapped
+    for field in CANONICAL_FIELDS:
+        if field not in finalized:
+            finalized[field] = None
+
+    return finalized
 
 
 def validate_mapping(
