@@ -11,9 +11,7 @@ _JUNK_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\ufeff\u00ad\u2060]")
 # Curly/smart quotes and stray backtick/accent that corrupt numeric fields
 _SMART_QUOTES_RE = re.compile(r'[\u201c\u201d\u2018\u2019"\'`´]')
 
-_UK_POSTCODE_RE = re.compile(
-    r"\b([A-Z]{1,2}\d[A-Z0-9]?\s*\d[A-Z]{2})\b", re.IGNORECASE
-)
+_UK_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d[A-Z0-9]?\s*\d[A-Z]{2})\b", re.IGNORECASE)
 
 # Trailing postcode with optional preceding comma/space — used to strip from address
 _TRAILING_POSTCODE_RE = re.compile(
@@ -61,6 +59,7 @@ def sanitize_field(key: str, value: str) -> str:
     if key_l in ("withdrawn_date", "date"):
         # Lazy import avoids circular dependency (field_extractors imports cleaner)
         from .field_extractors import extract_date
+
         normalized = extract_date(value)
         return normalized if normalized else scrub_cell_text(value)
     return scrub_cell_text(value)
