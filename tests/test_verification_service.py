@@ -21,6 +21,7 @@ class FakeLandRegistryClientSuccess:
         postcode: str,
         expected_owner_name: str,
         message_id: str = None,
+        **kwargs,
     ) -> OwnershipVerificationResult:
         """Return a successful ownership verification result."""
         return OwnershipVerificationResult(
@@ -40,6 +41,7 @@ class FakeLandRegistryClientMismatch:
         postcode: str,
         expected_owner_name: str,
         message_id: str = None,
+        **kwargs,
     ) -> OwnershipVerificationResult:
         """Return a successful response with a mismatching owner name."""
         return OwnershipVerificationResult(
@@ -59,6 +61,7 @@ class FakeLandRegistryClientError:
         postcode: str,
         expected_owner_name: str,
         message_id: str = None,
+        **kwargs,
     ) -> OwnershipVerificationResult:
         """Return an error verification result."""
         return OwnershipVerificationResult(
@@ -78,6 +81,7 @@ class FakeLandRegistryClientException:
         postcode: str,
         expected_owner_name: str,
         message_id: str = None,
+        **kwargs,
     ) -> OwnershipVerificationResult:  # type: ignore[override]
         """Raise a runtime error to simulate unexpected failure."""
         raise RuntimeError("Simulated unexpected failure")
@@ -257,7 +261,7 @@ async def test_verify_suspicious_matches_summary_counts(db_session: AsyncSession
         agency_id="agency-5",
         address="1 Summary Street",
         normalized_address="1 SUMMARY STREET",
-        postcode="SS1 1SS",
+        postcode=None,
         client_name="Summary User",
         status="active",
         created_at=datetime.now(timezone.utc),
@@ -314,6 +318,7 @@ async def test_verify_suspicious_matches_summary_counts(db_session: AsyncSession
             postcode: str,
             expected_owner_name: str,
             message_id: str = None,
+            **kwargs,
         ) -> OwnershipVerificationResult:
             """Return different results depending on the supplied postcode."""
             if postcode == "PC-CONFIRMED":
@@ -355,4 +360,3 @@ async def test_verify_suspicious_matches_summary_counts(db_session: AsyncSession
     assert summary.not_fraud_count == 1
     assert summary.error_count == 1
     assert len(summary.results) == 3
-

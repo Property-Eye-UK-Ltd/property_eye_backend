@@ -9,7 +9,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload, joinedload
+from sqlalchemy.orm import selectinload
 
 from src.api import deps
 from src.db.session import get_db
@@ -21,10 +21,7 @@ from src.schemas.verification import (
     VerificationResult,
     VerificationSummary,
 )
-from src.services.address_normalizer import AddressNormalizer
-from src.services.fraud_detector import FraudDetector
 from src.services.land_registry_client import LandRegistryClient
-from src.services.ppd_service import PPDService
 from src.services.verification_service import VerificationService
 
 logger = logging.getLogger(__name__)
@@ -164,15 +161,14 @@ async def get_verification_status(
     "/verify-listing/{listing_id}",
     response_model=VerificationSummary,
     status_code=status.HTTP_200_OK,
-    summary="Manually verify a property listing via HMLR (HM Flow)",
+    summary="Manually verify a property listing via HMLR (direct)",
     description="""
-    Directly triggers the full HM Flow (Stage 1 + Stage 2) for a single property listing.
+    Directly calls HMLR Online Owner Verification for a single property listing.
 
-    If the listing already has suspicious fraud matches, they are passed straight to
-    HMLR verification. If no matches exist yet, a mini fraud-scan is run first to
-    generate them, and the results are then verified.
+    This bypasses PPD screening and fraud matches so the HMLR integration can be
+    tested directly from the listings page.
 
-    Returns a VerificationSummary containing the outcome for every match found.
+    Returns a VerificationSummary containing a single direct verification result.
     """,
 )
 async def verify_listing(
@@ -181,7 +177,7 @@ async def verify_listing(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Verify a single property listing through the full HMLR flow.
+    Verify a single property listing directly via HMLR.
     """
     agency_id = current_agency.id
     logger.info(
@@ -204,57 +200,24 @@ async def verify_listing(
                 detail=f"Property listing {listing_id} not found or access denied",
             )
 
-        # 2. Look for existing fraud matches for this listing
-        match_stmt = (
-            select(FraudMatch)
-            .where(FraudMatch.property_listing_id == listing_id)
-            .options(joinedload(FraudMatch.property_listing))
-        )
-        match_result = await db.execute(match_stmt)
-        existing_matches = match_result.scalars().all()
-
-        # 3. If no matches yet, run Stage 1 (mini-scan) for this listing only
-        if not existing_matches:
-            logger.info(
-                f"No existing matches for listing {listing_id}; running mini fraud scan"
-            )
-            ppd_service = PPDService()
-            address_normalizer = AddressNormalizer()
-            fraud_detector = FraudDetector(ppd_service, address_normalizer)
-            ppd_df = fraud_detector.ppd_service.query_ppd_for_properties([listing])
-
-            if not ppd_df.empty:
-                new_matches = await fraud_detector._match_property_to_ppd(
-                    listing, ppd_df, db
-                )
-                existing_matches = new_matches
-
-        # 4. If still no matches, return empty summary
-        if not existing_matches:
-            return VerificationSummary(
-                total_verified=0,
-                confirmed_fraud_count=0,
-                not_fraud_count=0,
-                error_count=0,
-                results=[],
-                message=(
-                    "No fraud matches found for this listing. "
-                    "No PPD records matched the address/date criteria."
-                ),
-            )
-
-        # 5. Run Stage 2 (HMLR verification) on all matches
-        match_ids = [m.id for m in existing_matches]
-        logger.info(
-            f"Running HMLR verification on {len(match_ids)} matches for listing {listing_id}"
-        )
-
+        # Direct HMLR verification for the listing only (no PPD scan).
         land_registry_client = LandRegistryClient()
         verification_service = VerificationService(land_registry_client)
-        summary = await verification_service.verify_suspicious_matches(match_ids, db)
+        result = await verification_service.verify_listing_direct(listing)
         await land_registry_client.close()
 
-        return summary
+        confirmed_fraud_count = 1 if result.verification_status == "confirmed_fraud" else 0
+        not_fraud_count = 1 if result.verification_status == "not_fraud" else 0
+        error_count = 1 if result.verification_status == "error" else 0
+
+        return VerificationSummary(
+            total_verified=1,
+            confirmed_fraud_count=confirmed_fraud_count,
+            not_fraud_count=not_fraud_count,
+            error_count=error_count,
+            results=[result],
+            message="Direct HMLR verification complete.",
+        )
 
     except HTTPException:
         raise

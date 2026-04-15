@@ -54,7 +54,13 @@ def normalize_price_text(s: str) -> str:
 def sanitize_field(key: str, value: str) -> str:
     """Dispatch per-field sanitization; price gets normalization, dates get DD/MM/YYYY."""
     key_l = key.lower()
-    if key_l in ("price", "listing_price", "commission"):
+    if key_l in ("price", "listing_price"):
+        # Extract only the monetary token (e.g. "£900,000") from narrative cells.
+        from .field_extractors import extract_price
+
+        extracted = extract_price(value)
+        return extracted if extracted else normalize_price_text(value)
+    if key_l == "commission":
         return normalize_price_text(value)
     if key_l in ("withdrawn_date", "date"):
         # Lazy import avoids circular dependency (field_extractors imports cleaner)

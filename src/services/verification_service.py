@@ -211,6 +211,17 @@ class VerificationService:
 
             # API/infrastructure failure — could not complete verification.
             if api_result.verification_status == "error":
+                raw_preview = None
+                if api_result.raw_response:
+                    raw_preview = json.dumps(api_result.raw_response, default=str)
+                    if len(raw_preview) > 800:
+                        raw_preview = f"{raw_preview[:800]}…"
+                logger.warning(
+                    "HMLR verification error for match %s: %s raw=%s",
+                    match_id,
+                    api_result.error_message,
+                    raw_preview or "<none>",
+                )
                 fraud_match.verification_status = "error"
                 fraud_match.is_confirmed_fraud = False
                 await db.commit()
@@ -275,7 +286,7 @@ class VerificationService:
             )
 
         except Exception as e:
-            logger.error(f"Error verifying match {match_id}: {str(e)}")
+            logger.exception("Error verifying match %s: %s", match_id, str(e))
 
             fraud_match.verification_status = "error"
             fraud_match.is_confirmed_fraud = False
@@ -292,6 +303,98 @@ class VerificationService:
                 verified_at=fraud_match.verified_at,
                 error_message=str(e),
             )
+
+    async def verify_listing_direct(
+        self, listing: PropertyListing
+    ) -> VerificationResult:
+        """
+        Directly verify a listing via HMLR without PPD screening.
+
+        Args:
+            listing: Property listing to verify
+
+        Returns:
+            VerificationResult for this listing
+        """
+        title_no = (
+            (listing.title_number or "").strip()
+            if getattr(listing, "title_number", None)
+            else ""
+        )
+        verify_addr = _verification_street_address(listing)
+        verify_pc = _effective_postcode_for_lr(listing, "")
+        town = (
+            (listing.region or "").strip()
+            if getattr(listing, "region", None)
+            else ""
+        ) or None
+
+        pc_src = (
+            "listing"
+            if (listing.postcode and str(listing.postcode).strip())
+            else (
+                "parsed_address"
+                if listing.address and _UK_POSTCODE_RE.search(listing.address)
+                else "empty"
+            )
+        )
+        logger.info(
+            "Direct HMLR verify listing %s: mode=%s listing_addr_len=%s postcode_source=%s town_set=%s",
+            listing.id,
+            "title_number" if title_no else "address",
+            len(verify_addr or ""),
+            pc_src,
+            bool(town),
+        )
+
+        api_result = await self.land_registry_client.verify_ownership(
+            property_address=verify_addr,
+            postcode=verify_pc,
+            expected_owner_name=listing.client_name or "",
+            message_id=listing.id,
+            title_number=title_no or None,
+            town=town,
+        )
+
+        verified_at = datetime.utcnow()
+        client_name = listing.client_name or "Unknown"
+
+        if api_result.verification_status == "error":
+            return VerificationResult(
+                match_id=listing.id,
+                property_address=listing.address,
+                client_name=client_name,
+                verification_status="error",
+                verified_owner_name=None,
+                is_confirmed_fraud=False,
+                verified_at=verified_at,
+                error_message=api_result.error_message,
+            )
+
+        if api_result.verification_status == "not_fraud":
+            return VerificationResult(
+                match_id=listing.id,
+                property_address=listing.address,
+                client_name=client_name,
+                verification_status="not_fraud",
+                verified_owner_name=None,
+                is_confirmed_fraud=False,
+                verified_at=verified_at,
+                error_message=None,
+            )
+
+        is_match = self._compare_owner_names(api_result.owner_name, listing.client_name or "")
+        status = "confirmed_fraud" if is_match else "not_fraud"
+        return VerificationResult(
+            match_id=listing.id,
+            property_address=listing.address,
+            client_name=client_name,
+            verification_status=status,
+            verified_owner_name=api_result.owner_name,
+            is_confirmed_fraud=is_match,
+            verified_at=verified_at,
+            error_message=None,
+        )
 
     def _compare_owner_names(self, api_owner_name: str, client_name: str) -> bool:
         """

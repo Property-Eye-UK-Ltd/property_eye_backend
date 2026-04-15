@@ -8,9 +8,11 @@ for the rest of the application.
 
 import logging
 import re
+import socket
 import ssl
 import uuid
 from typing import Optional
+from urllib.parse import urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 import httpx
@@ -58,6 +60,8 @@ class LandRegistryClient:
         base_url = (config.HMLR_BG_BASE_URL or "").rstrip("/")
         if not base_url:
             logger.warning("HMLR_BG_BASE_URL is not configured; OOV calls will fail.")
+        parsed_base = urlparse(base_url)
+        self._bg_host = parsed_base.hostname or ""
 
         self._username = config.HMLR_BG_USERNAME
         self._password = config.HMLR_BG_PASSWORD
@@ -72,19 +76,13 @@ class LandRegistryClient:
         is_test = "bgtest" in base_url
         self._is_test_mode = is_test
         stub_or_engine = "EOOV_StubService" if is_test else "EOOV_SoapEngine"
-        self._oov_path = (
-            f"/b2b/{stub_or_engine}/OnlineOwnershipVerificationV1_0WebService"
-        )
+        self._oov_path = f"/b2b/{stub_or_engine}/OnlineOwnershipVerificationV1_0WebService"
 
         # Build an explicit SSL context for mutual TLS and CA verification.
         # HMLR_CA_BUNDLE_PATH must be set — system CAs do not include the HMLR
         # root CA, so omitting it will always produce CERTIFICATE_VERIFY_FAILED.
         if not self._ca_bundle_path:
-            raise RuntimeError(
-                "HMLR_CA_BUNDLE_PATH is not configured. "
-                "Mutual TLS to the HMLR Business Gateway requires the HMLR CA bundle. "
-                "Set HMLR_CA_BUNDLE_PATH in your .env to the path of hmlr-ca-bundle.pem."
-            )
+            raise RuntimeError("HMLR_CA_BUNDLE_PATH is not configured. ")
 
         ssl_context = ssl.create_default_context(cafile=self._ca_bundle_path)
         ssl_context.load_cert_chain(
@@ -108,6 +106,25 @@ class LandRegistryClient:
         soap_body = self._build_oov_request_xml(request)
 
         try:
+            if self._bg_host and not self._can_resolve_hostname(self._bg_host):
+                logger.error(
+                    "Cannot resolve HMLR Business Gateway host '%s' (base_url=%s)",
+                    self._bg_host,
+                    self.client.base_url,
+                )
+                return OovResponse(
+                    external_reference=request.external_reference,
+                    status_code="bg.dns.error",
+                    status_message=(
+                        f"Cannot resolve hostname '{self._bg_host}'. "
+                        "Check DNS/egress from the running environment or use the "
+                        "correct HMLR endpoint for that environment."
+                    ),
+                    matches=[],
+                    raw_status_code=0,
+                    raw_body=None,
+                )
+
             logger.info(
                 "HMLR OOV POST %s ref=%s soap_bytes=%s",
                 self._oov_path,
@@ -125,6 +142,16 @@ class LandRegistryClient:
                 request.external_reference,
                 len(response.content or b""),
             )
+            if response.status_code >= 400:
+                body_preview = (response.text or "").replace("\n", " ").strip()
+                if len(body_preview) > 800:
+                    body_preview = f"{body_preview[:800]}…"
+                logger.warning(
+                    "HMLR OOV HTTP error status=%s ref=%s body=%s",
+                    response.status_code,
+                    request.external_reference,
+                    body_preview or "<empty>",
+                )
         except httpx.TimeoutException as exc:
             logger.error("Timeout calling HMLR OOV service: %s", exc)
             return OovResponse(
@@ -137,6 +164,19 @@ class LandRegistryClient:
             )
         except httpx.RequestError as exc:
             logger.error("Request error calling HMLR OOV service: %s", exc)
+            if self._is_name_resolution_error(exc):
+                host = self._bg_host or "<unknown>"
+                return OovResponse(
+                    external_reference=request.external_reference,
+                    status_code="bg.dns.error",
+                    status_message=(
+                        f"Cannot resolve hostname '{host}' ({exc}). "
+                        "Check DNS/egress from the running environment."
+                    ),
+                    matches=[],
+                    raw_status_code=0,
+                    raw_body=None,
+                )
             return OovResponse(
                 external_reference=request.external_reference,
                 status_code="bg.request.error",
@@ -197,11 +237,25 @@ class LandRegistryClient:
         building_part, street_part = self._split_address(property_address)
         person_forename, person_surname = self._split_name(expected_owner_name)
 
+        if not (person_forename and person_surname) and not self._is_test_mode:
+            return OwnershipVerificationResult(
+                owner_name=None,
+                verification_status="error",
+                error_message=(
+                    "bg.name.invalid: FirstForename and Surname are required "
+                    "for Online Owner Verification requests"
+                ),
+                raw_response={
+                    "status_code": "bg.name.invalid",
+                    "status_message": "Missing owner forename/surname",
+                },
+            )
+
         address = OovAddress(
             building_name_or_number=building_part,
             street=street_part,
             town=(town.strip()[:35] if town and town.strip() else None),
-            postcode=postcode or None,
+            postcode=self._normalise_uk_postcode(postcode) or None,
         )
 
         if message_id:
@@ -263,6 +317,7 @@ class LandRegistryClient:
             "bg.soap.fault",
             "bg.timeout",
             "bg.request.error",
+            "bg.dns.error",
             "bg.parse.error",
             "bg.response.missing",
             "bg.unknown",
@@ -273,6 +328,13 @@ class LandRegistryClient:
             and "rejection" not in oov_response.status_code
             and oov_response.status_code not in {"bg.properties.nopropertyfound"}
         ):
+            logger.warning(
+                "HMLR OOV verification failed ref=%s code=%s message=%s raw_status=%s",
+                oov_response.external_reference,
+                oov_response.status_code,
+                oov_response.status_message,
+                oov_response.raw_status_code,
+            )
             return OwnershipVerificationResult(
                 owner_name=None,
                 verification_status="error",
@@ -285,6 +347,13 @@ class LandRegistryClient:
         if oov_response.status_code.startswith("bg.properties.") or (
             oov_response.status_code == "bg.rejection"
         ):
+            logger.warning(
+                "HMLR OOV property rejection ref=%s code=%s message=%s raw_status=%s",
+                oov_response.external_reference,
+                oov_response.status_code,
+                oov_response.status_message,
+                oov_response.raw_status_code,
+            )
             return OwnershipVerificationResult(
                 owner_name=None,
                 verification_status="error",
@@ -314,7 +383,7 @@ class LandRegistryClient:
         title_number: Optional[str] = None,
     ) -> Optional[dict]:
         """Validate key LR business-rule criteria before sending live requests."""
-        clean_postcode = (postcode or "").strip().upper()
+        clean_postcode = self._normalise_uk_postcode(postcode)
         clean_address = (property_address or "").strip()
 
         # BRL-ISBG-011: validate title number format when provided.
@@ -367,9 +436,28 @@ class LandRegistryClient:
         return bool(re.match(postcode_pattern, postcode.strip().upper()))
 
     def _is_valid_title_number(self, title_number: str) -> bool:
-        """Check title number syntax (letters prefix + numeric suffix)."""
+        """Check title number syntax against the OOV request schema pattern."""
         candidate = title_number.strip().upper()
-        return bool(re.match(r"^[A-Z]{1,4}[0-9]{1,12}$", candidate))
+        return bool(re.match(r"^(?:[A-Y]{0,3}\d{1,6}|Z\d{1,6}Z)$", candidate))
+
+    def _normalise_uk_postcode(self, postcode: str) -> str:
+        """Normalise postcode to uppercase with a single inward-code separator space."""
+        compact = re.sub(r"\s+", "", (postcode or "").upper())
+        if len(compact) > 3:
+            return f"{compact[:-3]} {compact[-3:]}"
+        return compact
+
+    def _normalise_name_for_oov(self, value: Optional[str], allow_spaces: bool) -> str:
+        """Sanitise name values to characters accepted by the OOV request schema."""
+        candidate = (value or "").strip()
+        if not candidate:
+            return ""
+        if allow_spaces:
+            cleaned = re.sub(r"[^A-Za-z0-9\-\s']", "", candidate)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        else:
+            cleaned = re.sub(r"[^A-Za-z0-9\-']", "", candidate)
+        return cleaned
 
     def _looks_like_city_present(self, full_address: str) -> bool:
         """Detect whether a free-form address appears to include a town/city."""
@@ -377,6 +465,24 @@ class LandRegistryClient:
         # usually includes town/city near the end.
         parts = [p.strip() for p in full_address.split(",") if p.strip()]
         return len(parts) >= 3
+
+    def _can_resolve_hostname(self, hostname: str) -> bool:
+        """Return True when the target hostname can be resolved in this environment."""
+        try:
+            socket.getaddrinfo(hostname, 443)
+            return True
+        except OSError:
+            return False
+
+    def _is_name_resolution_error(self, exc: Exception) -> bool:
+        """Detect request failures caused by DNS name resolution."""
+        current: Optional[BaseException] = exc
+        while current:
+            if isinstance(current, socket.gaierror):
+                return True
+            current = current.__cause__ or current.__context__
+        message = str(exc).lower()
+        return "name or service not known" in message or "temporary failure in name resolution" in message
 
     async def close(self) -> None:
         """Close the underlying HTTP client connection."""
@@ -397,13 +503,20 @@ class LandRegistryClient:
         reference = xml_escape(request.external_reference)
 
         # WS-Security UsernameToken header (mandatory for all BG services).
+        # NOTE: 'Type' MUST be uppercase — the OASIS WS-Security spec is case-sensitive.
+        # Lowercase 'type' causes HMLR BG to reject auth with "Login details are invalid".
+        # DO NOT add mustUnderstand="1" — the BG SOAP engine does not have a WS-Security
+        # MustUnderstand handler registered. Setting it causes a soap:MustUnderstand fault
+        # before authentication is even attempted. The Security header is processed correctly
+        # without it via the gateway's internal WS-Security subsystem.
         wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
         pw_type = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
+        print('username & password', self._username, self._password)
         wsse_header = (
             f'<wsse:Security xmlns:wsse="{wsse_ns}">'
             f"<wsse:UsernameToken>"
             f"<wsse:Username>{xml_escape(self._username)}</wsse:Username>"
-            f'<wsse:Password type="{pw_type}">{xml_escape(self._password)}</wsse:Password>'
+            f'<wsse:Password Type="{pw_type}">{xml_escape(self._password)}</wsse:Password>'
             f"</wsse:UsernameToken>"
             f"</wsse:Security>"
             f'<i18n:international xmlns:i18n="http://www.w3.org/2005/09/ws-i18n">'
@@ -423,7 +536,12 @@ class LandRegistryClient:
             # BuildingNumber vs BuildingName: use BuildingNumber for numeric-
             # looking values, BuildingName otherwise.
             building_val = addr.building_name_or_number or ""
-            if building_val.split()[0].rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ").isdigit():
+            first_token = building_val.split()[0] if building_val.split() else ""
+            if (
+                first_token
+                .rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                .isdigit()
+            ):
                 building_xml = f"<req:BuildingNumber>{xml_escape(building_val[:5])}</req:BuildingNumber>"
             else:
                 building_xml = f"<req:BuildingName>{xml_escape(building_val[:50])}</req:BuildingName>"
@@ -454,16 +572,25 @@ class LandRegistryClient:
 
         # FirstForename and Surname are direct children of RequestOOV (not
         # wrapped in a PersonName element). Both are mandatory per the XSD.
-        forename_xml = ""
-        surname_xml = ""
+        if not request.person_name:
+            raise ValueError(
+                "OOV request must include person_name with forename and surname."
+            )
+
+        first = self._normalise_name_for_oov(
+            request.person_name.forename, allow_spaces=False
+        )
+        surname = self._normalise_name_for_oov(
+            request.person_name.surname, allow_spaces=True
+        )
+        if not first or not surname:
+            raise ValueError(
+                "OOV person_name must include valid forename and surname values."
+            )
+
+        forename_xml = f"<req:FirstForename>{xml_escape(first)}</req:FirstForename>"
+        surname_xml = f"<req:Surname>{xml_escape(surname)}</req:Surname>"
         middle_xml = ""
-        if request.person_name:
-            first = (request.person_name.forename or "").strip()
-            surname = (request.person_name.surname or "").strip()
-            if not first or not surname:
-                logger.debug("Partial person name supplied; OOV may reject this request.")
-            forename_xml = f"<req:FirstForename>{xml_escape(first)}</req:FirstForename>"
-            surname_xml = f"<req:Surname>{xml_escape(surname)}</req:Surname>"
 
         # Indicators.
         skip_partial = not request.partial_match
@@ -489,7 +616,9 @@ class LandRegistryClient:
         # the RequestOOV fields directly in the req namespace.
         # tns = http://ownershipv1_0.ws.bg.lr.gov/
         # req = http://www.landregistry.gov.uk/OOV/RequestOnlineOwnershipVerificationV1_0
-        req_ns = "http://www.landregistry.gov.uk/OOV/RequestOnlineOwnershipVerificationV1_0"
+        req_ns = (
+            "http://www.landregistry.gov.uk/OOV/RequestOnlineOwnershipVerificationV1_0"
+        )
         tns_ns = "http://ownershipv1_0.ws.bg.lr.gov/"
 
         body_inner = (
@@ -528,11 +657,15 @@ class LandRegistryClient:
         try:
             # strip_whitespace + process_namespaces collapses ns prefixes to
             # bare local names, which makes downstream key lookups namespace-agnostic.
-            parsed = xmltodict.parse(raw_body, process_namespaces=True, namespaces={
-                "http://schemas.xmlsoap.org/soap/envelope/": "soapenv",
-                "http://ownershipv1_0.ws.bg.lr.gov/": "tns",
-                "http://www.landregistry.gov.uk/OOV/ResponseOnlineOwnershipVerificationV1_0": None,
-            })
+            parsed = xmltodict.parse(
+                raw_body,
+                process_namespaces=True,
+                namespaces={
+                    "http://schemas.xmlsoap.org/soap/envelope/": "soapenv",
+                    "http://ownershipv1_0.ws.bg.lr.gov/": "tns",
+                    "http://www.landregistry.gov.uk/OOV/ResponseOnlineOwnershipVerificationV1_0": None,
+                },
+            )
         except Exception as exc:
             logger.error("Failed to parse OOV XML response: %s", exc)
             return OovResponse(
@@ -564,7 +697,9 @@ class LandRegistryClient:
             fault_string = soap_fault.get("faultstring", "SOAP Fault")
             detail = soap_fault.get("detail") or {}
             # Collect all SchemaException messages from detail.
-            schema_exc = detail.get("SchemaException") or detail.get("oov:SchemaException")
+            schema_exc = detail.get("SchemaException") or detail.get(
+                "oov:SchemaException"
+            )
             if isinstance(schema_exc, list):
                 schema_msg = "; ".join(str(e) for e in schema_exc)
             elif schema_exc:
@@ -591,6 +726,7 @@ class LandRegistryClient:
 
         # Log the raw parsed payload so tests can see exactly what HMLR returned.
         import json as _json
+
         logger.info(
             "HMLR OOV raw response payload:\n%s",
             _json.dumps(response_oov, indent=2, default=str),
@@ -678,9 +814,7 @@ class LandRegistryClient:
                 POSITIVE = {"MATCH", "PARTIAL_MATCH"}
                 name_is_match = (
                     surname_type in POSITIVE and forename_type not in {"NO_MATCH"}
-                ) or (
-                    surname_type == "NO_MATCH" and string_type == "MATCH"
-                )
+                ) or (surname_type == "NO_MATCH" and string_type == "MATCH")
 
                 match_infos = m.get("MatchInformation") or []
                 if isinstance(match_infos, dict):
