@@ -502,26 +502,27 @@ class LandRegistryClient:
         message_id = xml_escape(request.external_reference)
         reference = xml_escape(request.external_reference)
 
-        # WS-Security UsernameToken header (mandatory for all BG services).
-        # NOTE: 'Type' MUST be uppercase — the OASIS WS-Security spec is case-sensitive.
-        # Lowercase 'type' causes HMLR BG to reject auth with "Login details are invalid".
-        # DO NOT add mustUnderstand="1" — the BG SOAP engine does not have a WS-Security
-        # MustUnderstand handler registered. Setting it causes a soap:MustUnderstand fault
-        # before authentication is even attempted. The Security header is processed correctly
-        # without it via the gateway's internal WS-Security subsystem.
-        wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+        # WS-Security UsernameToken header per HMLR OOV Interface Spec.
+        # - No mustUnderstand (causes soap:MustUnderstand fault on HMLR BG)
+        # - No Timestamp, Nonce, or Created (not expected by this endpoint)
+        # - Only Username + Password (PasswordText) inside UsernameToken
         pw_type = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
-        print('username & password', self._username, self._password)
+        username_xml = xml_escape(self._username or "")
+        password_xml = xml_escape(self._password or "")
+        print("---" * 30)
+        print('*** Building WS-Security header with username "%s" and password %s', username_xml, password_xml)
+        
+        print("---" * 30)
         wsse_header = (
-            f'<wsse:Security xmlns:wsse="{wsse_ns}">'
-            f"<wsse:UsernameToken>"
-            f"<wsse:Username>{xml_escape(self._username)}</wsse:Username>"
-            f'<wsse:Password Type="{pw_type}">{xml_escape(self._password)}</wsse:Password>'
-            f"</wsse:UsernameToken>"
-            f"</wsse:Security>"
-            f'<i18n:international xmlns:i18n="http://www.w3.org/2005/09/ws-i18n">'
-            f"<i18n:locale>en</i18n:locale>"
-            f"</i18n:international>"
+            "<wsse:Security>"
+            "<wsse:UsernameToken>"
+            f"<wsse:Username>{username_xml}</wsse:Username>"
+            f'<wsse:Password Type="{pw_type}">{password_xml}</wsse:Password>'
+            "</wsse:UsernameToken>"
+            "</wsse:Security>"
+            '<i18n:international xmlns:i18n="http://www.w3.org/2005/09/ws-i18n">'
+            "<i18n:locale>en</i18n:locale>"
+            "</i18n:international>"
         )
 
         # SubjectProperty: title number or property address (title preferred).
@@ -631,9 +632,14 @@ class LandRegistryClient:
             f"{indicators_xml}"
         )
 
+        wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+        req_ns = "http://www.landregistry.gov.uk/OOV/RequestOnlineOwnershipVerificationV1_0"
+        tns_ns = "http://ownershipv1_0.ws.bg.lr.gov/"
+
         return (
             '<?xml version="1.0" encoding="UTF-8"?>'
             f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+            f' xmlns:wsse="{wsse_ns}"'
             f' xmlns:req="{req_ns}"'
             f' xmlns:tns="{tns_ns}">'
             f"<soapenv:Header>{wsse_header}</soapenv:Header>"
