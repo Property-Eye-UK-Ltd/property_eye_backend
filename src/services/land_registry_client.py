@@ -39,11 +39,15 @@ class OwnershipVerificationResult:
         verification_status: str = "error",
         error_message: Optional[str] = None,
         raw_response: Optional[dict] = None,
+        expected_response_datetime: Optional[str] = None,
+        unique_id: Optional[str] = None,
     ):
         self.owner_name = owner_name
         self.verification_status = verification_status
         self.error_message = error_message
         self.raw_response = raw_response
+        self.expected_response_datetime = expected_response_datetime
+        self.unique_id = unique_id
 
 
 class LandRegistryClient:
@@ -294,12 +298,7 @@ class LandRegistryClient:
 
         try:
             oov_response = await self.verify_owner(oov_request)
-            logger.info(
-                "OOV SOAP outcome ref=%s code=%s matches=%s",
-                ref,
-                oov_response.status_code,
-                len(oov_response.matches),
-            )
+            return self.process_oov_outcome(oov_response, expected_owner_name)
         except Exception as exc:
             logger.error("Unexpected error during OOV verification: %s", exc)
             return OwnershipVerificationResult(
@@ -309,6 +308,15 @@ class LandRegistryClient:
                 raw_response=None,
             )
 
+    def process_oov_outcome(
+        self,
+        oov_response: OovResponse,
+        expected_owner_name: str,
+    ) -> OwnershipVerificationResult:
+        """
+        Process a parsed OovResponse (from either a fresh request or a poll)
+        into a high-level OwnershipVerificationResult.
+        """
         # True API/infrastructure failures: rejection, timeout, parse error, etc.
         # These are codes where we couldn't complete verification at all.
         # bg.match.found and bg.novalidmatch both indicate the API worked — just
@@ -322,6 +330,18 @@ class LandRegistryClient:
             "bg.response.missing",
             "bg.unknown",
         }
+        
+        # Handle queued status (acknowledgement)
+        if oov_response.status_code == "bg.acknowledgement":
+            return OwnershipVerificationResult(
+                owner_name=None,
+                verification_status="queued",
+                error_message=None,
+                raw_response=oov_response.model_dump(),
+                expected_response_datetime=oov_response.expected_response_datetime,
+                unique_id=oov_response.unique_id,
+            )
+
         if oov_response.status_code in _non_match_error_codes or (
             oov_response.status_code.startswith("bg.")
             and oov_response.status_code not in {"bg.match.found", "bg.novalidmatch"}
@@ -487,6 +507,82 @@ class LandRegistryClient:
     async def close(self) -> None:
         """Close the underlying HTTP client connection."""
         await self.client.aclose()
+
+    async def poll_verification_result(self, message_id: str) -> OovResponse:
+        """
+        Poll for the result of a previously queued OOV request using getResponse.
+        """
+        soap_body = self._build_get_response_xml(message_id)
+
+        try:
+            logger.info("HMLR OOV poll getResponse message_id=%s", message_id)
+            response = await self.client.post(
+                self._oov_path,
+                content=soap_body.encode("utf-8"),
+                headers={"Content-Type": "text/xml; charset=utf-8"},
+            )
+            logger.info(
+                "HMLR OOV poll HTTP status=%s message_id=%s",
+                response.status_code,
+                message_id,
+            )
+            if response.status_code >= 400:
+                logger.warning(
+                    "HMLR OOV poll HTTP error status=%s message_id=%s",
+                    response.status_code,
+                    message_id,
+                )
+        except Exception as exc:
+            logger.error("Error polling HMLR OOV service: %s", exc)
+            return OovResponse(
+                external_reference=message_id,
+                status_code="bg.request.error",
+                status_message=str(exc),
+                matches=[],
+                raw_status_code=0,
+                raw_body=None,
+            )
+
+        return self._parse_oov_response(response, fallback_reference=message_id)
+
+    def _build_get_response_xml(self, message_id: str) -> str:
+        """Build SOAP envelope for getResponse operation."""
+        message_id_xml = xml_escape(message_id)
+        
+        pw_type = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
+        username_xml = xml_escape(self._username or "")
+        password_xml = xml_escape(self._password or "")
+        
+        wsse_header = (
+            "<wsse:Security>"
+            "<wsse:UsernameToken>"
+            f"<wsse:Username>{username_xml}</wsse:Username>"
+            f'<wsse:Password Type="{pw_type}">{password_xml}</wsse:Password>'
+            "</wsse:UsernameToken>"
+            "</wsse:Security>"
+            '<i18n:international xmlns:i18n="http://www.w3.org/2005/09/ws-i18n">'
+            "<i18n:locale>en</i18n:locale>"
+            "</i18n:international>"
+        )
+
+        wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+        req_ns = "http://www.landregistry.gov.uk/OOV/RequestOnlineOwnershipVerificationV1_0"
+        tns_ns = "http://ownershipv1_0.ws.bg.lr.gov/"
+
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+            f' xmlns:wsse="{wsse_ns}"'
+            f' xmlns:req="{req_ns}"'
+            f' xmlns:tns="{tns_ns}">'
+            f"<soapenv:Header>{wsse_header}</soapenv:Header>"
+            "<soapenv:Body>"
+            "<tns:getResponse>"
+            f"<in><req:MessageId>{message_id_xml}</req:MessageId></in>"
+            "</tns:getResponse>"
+            "</soapenv:Body>"
+            "</soapenv:Envelope>"
+        )
 
     def _build_oov_request_xml(self, request: OovRequest) -> str:
         """Build SOAP envelope for RequestOnlineOwnershipVerificationV1_0.
@@ -757,12 +853,16 @@ class LandRegistryClient:
 
         status_code = "bg.unknown"
         status_message: Optional[str] = None
+        unique_id: Optional[str] = None
+        expected_response_datetime: Optional[str] = None
         external_reference = fallback_reference or ""
         matches: list[OovMatchedTitle] = []
 
         if type_code == "10" and acknowledgement:
             status_code = "bg.acknowledgement"
             status_message = acknowledgement.get("MessageDescription")
+            unique_id = acknowledgement.get("UniqueID")
+            expected_response_datetime = acknowledgement.get("ExpectedResponseDateTime")
         elif type_code == "20" and rejection:
             status_code = rejection.get("Code", "bg.rejection")
             status_message = rejection.get("Reason")
@@ -858,6 +958,8 @@ class LandRegistryClient:
             external_reference=external_reference,
             status_code=status_code,
             status_message=status_message,
+            unique_id=unique_id,
+            expected_response_datetime=expected_response_datetime,
             matches=matches,
             raw_status_code=raw_status,
             raw_body=raw_body,

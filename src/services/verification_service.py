@@ -19,7 +19,9 @@ from src.models.property_listing import PropertyListing
 from src.schemas.verification import VerificationResult, VerificationSummary
 from src.services.address_normalizer import AddressNormalizer
 from src.services.land_registry_client import LandRegistryClient
-from src.utils.constants import config
+from src.core.config import settings
+from arq import create_pool
+from arq.connections import RedisSettings
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,16 @@ class VerificationService:
         """
         self.land_registry_client = land_registry_client
         self.address_normalizer = AddressNormalizer()
+        self._redis_pool = None
+
+    async def _get_redis_pool(self):
+        if self._redis_pool is None:
+            # Parse REDIS_URL to RedisSettings if needed, or just use URL
+            # arq.create_pool accepts RedisSettings or a redis URL string in some versions, 
+            # but usually it's RedisSettings.
+            from src.core.config import settings
+            self._redis_pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+        return self._redis_pool
 
     async def verify_suspicious_matches(
         self, match_ids: List[str], db: AsyncSession
@@ -93,6 +105,7 @@ class VerificationService:
         results = []
         confirmed_fraud_count = 0
         not_fraud_count = 0
+        queued_count = 0
         error_count = 0
 
         for match_id in match_ids:
@@ -103,22 +116,26 @@ class VerificationService:
                 confirmed_fraud_count += 1
             elif result.verification_status == "not_fraud":
                 not_fraud_count += 1
+            elif result.verification_status == "queued":
+                queued_count += 1
             else:
                 error_count += 1
 
         message = (
             f"Stage 2 complete: {confirmed_fraud_count} confirmed fraud cases, "
-            f"{not_fraud_count} ruled out, {error_count} error(s)"
+            f"{not_fraud_count} ruled out, {queued_count} queued, {error_count} error(s)"
         )
 
         return VerificationSummary(
             total_verified=len(match_ids),
             confirmed_fraud_count=confirmed_fraud_count,
             not_fraud_count=not_fraud_count,
+            queued_count=queued_count,
             error_count=error_count,
             results=results,
             message=message,
         )
+
 
     async def verify_single_match(
         self, match_id: str, db: AsyncSession
@@ -235,6 +252,44 @@ class VerificationService:
                     is_confirmed_fraud=False,
                     verified_at=fraud_match.verified_at,
                     error_message=api_result.error_message,
+                )
+
+            # Handle queued status
+            if api_result.verification_status == "queued":
+                fraud_match.verification_status = "queued"
+                fraud_match.is_confirmed_fraud = False
+                await db.commit()
+                
+                # Schedule background poll
+                try:
+                    redis = await self._get_redis_pool()
+                    # Calculate delay based on expected_response_datetime if possible
+                    # HMLR format: "2026-04-23T06:41:01"
+                    delay = 0
+                    if api_result.expected_response_datetime:
+                        try:
+                            expected_at = datetime.fromisoformat(api_result.expected_response_datetime)
+                            now = datetime.now() # OOV uses local/UK time usually
+                            if expected_at > now:
+                                delay = int((expected_at - now).total_seconds())
+                        except Exception as e:
+                            logger.warning(f"Could not parse expected_at {api_result.expected_response_datetime}: {e}")
+                    
+                    # Schedule with arq
+                    await redis.enqueue_job("poll_hmlr_task", match_id, _defer_by=delay)
+                    logger.info(f"Scheduled HMLR poll for match {match_id} in {delay} seconds")
+                except Exception as e:
+                    logger.error(f"Failed to schedule HMLR poll for match {match_id}: {e}")
+
+                return VerificationResult(
+                    match_id=match_id,
+                    property_address=property_listing.address,
+                    client_name=property_listing.client_name,
+                    verification_status="queued",
+                    verified_owner_name=None,
+                    is_confirmed_fraud=False,
+                    verified_at=fraud_match.verified_at,
+                    error_message="Request queued by Land Registry. Verification will complete in background.",
                 )
 
             # HMLR verified the property but the owner name did not match —
@@ -382,6 +437,21 @@ class VerificationService:
                 verified_at=verified_at,
                 error_message=None,
             )
+
+        if api_result.verification_status == "queued":
+            # For direct verification, we might not have a FraudMatch record yet,
+            # but we can still return the queued status.
+            return VerificationResult(
+                match_id=listing.id,
+                property_address=listing.address,
+                client_name=client_name,
+                verification_status="queued",
+                verified_owner_name=None,
+                is_confirmed_fraud=False,
+                verified_at=verified_at,
+                error_message="Request queued by Land Registry.",
+            )
+
 
         is_match = self._compare_owner_names(api_result.owner_name, listing.client_name or "")
         status = "confirmed_fraud" if is_match else "not_fraud"

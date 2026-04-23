@@ -59,6 +59,8 @@ class OovResponse(BaseModel):
     external_reference: str
     status_code: str
     status_message: Optional[str] = None
+    unique_id: Optional[str] = None
+    expected_response_datetime: Optional[str] = None
     matches: List[OovMatchedTitle] = Field(default_factory=list)
     raw_status_code: int
     raw_body: Optional[str] = None

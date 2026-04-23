@@ -47,7 +47,7 @@ class VerificationResult(BaseModel):
     client_name: str = Field(..., description="Agency client name")
 
     verification_status: str = Field(
-        ..., description="Verification status: confirmed_fraud, not_fraud, or error"
+        ..., description="Verification status: confirmed_fraud, not_fraud, queued, or error"
     )
     verified_owner_name: Optional[str] = Field(
         None, description="Owner name from Land Registry"
@@ -87,6 +87,9 @@ class VerificationSummary(BaseModel):
     )
     not_fraud_count: int = Field(
         ..., description="Number of matches ruled out as fraud"
+    )
+    queued_count: int = Field(
+        0, description="Number of matches queued for later processing"
     )
     error_count: int = Field(..., description="Number of verification errors")
     results: list[VerificationResult] = Field(
