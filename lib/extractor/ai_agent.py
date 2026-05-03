@@ -70,7 +70,15 @@ Canonical fields (use exactly these keys):
                         "Sole Agency 1.25%", "Multi Agency 2%".
                       Map the cell containing a percentage near a currency symbol or
                       near the word "agency" / "commission".  Return null if absent.
-  client_name       — Property owner / vendor full name.  Use "N+M" if split across cells.
+  client_name       — Introduced BUYER / purchaser / applicant / prospect (the purchasing-side
+                      contact you may later compare to Land Registry).  Map ONLY when the column
+                      header explicitly signals the purchasing party (e.g. Applicant, Buyer,
+                      Purchaser, Prospect, "Purchasing Client").  Return null if unsure or if the
+                      column is vendor/seller/landlord or an ambiguous "Name" / "Client" alone
+                      (UK CRMs often label the vendor as "Client").
+  vendor_name       — Seller / vendor / landlord (selling party).  Map Vendor Name, Seller,
+                      Landlord, Lessor, or ambiguous Name/Contact when there is no explicit
+                      purchaser column.  Use "N+M" if first and last name are split across cells.
   contract_duration — Length of the agency contract (e.g. "12 weeks", "3 months").
   property_number   — House or flat number only (e.g. "11", "Flat 3").
   title_number      — HM Land Registry title number (2–3 uppercase district letters followed by
@@ -87,7 +95,10 @@ Rules (STRICT — the reviewer will reject violations):
      • region / county are embedded inside the address      →  ">0", not separate indices
 2. Use "N+M" only when the cells are separate columns that should be joined.
 3. Use "N?" when you are guessing; never silently map a dubious cell without "?".
-4. Output ONLY valid JSON — no markdown fences, no explanation outside the JSON.
+4. NEVER map vendor-only columns (Vendor, Seller, Landlord, etc.) to client_name — use vendor_name.
+   NEVER map generic "Name" or "Client" alone to client_name unless the header clearly indicates
+   the purchaser (Buyer, Applicant, Prospect, Purchaser, etc.).
+5. Output ONLY valid JSON — no markdown fences, no explanation outside the JSON.
 """
 
 # ---------------------------------------------------------------------------
@@ -116,13 +127,16 @@ Correct output:
   "price": ">2",
   "withdrawn_date": "3",
   "commission": "5",
-  "client_name": "6",
+  "vendor_name": "6",
+  "client_name": null,
   "title_number": "7",
   "contract_duration": null
 }
 
 Note: postcode/region/county all use ">0" because they are substrings of cell 0.
       price uses ">2" because the amount is buried inside narrative text.
+      Cell [6] is a lone personal name with no column context — treat as vendor_name (seller side),
+      not client_name (buyer); leave client_name null unless a separate cell clearly indicates the purchaser.
       title_number uses "7" because cell 7 is a dedicated HMLR title number (HD567890).
       Use ">N" for title_number only if the HMLR code is embedded inside a larger notes field.
 ──────────────────────────────────────────────────────────────────────────────
@@ -137,8 +151,9 @@ Column headers:
   [3] 'Date Withdrawn'
   [4] 'Status'
   [5] 'Vendor Name'
-  [6] 'Commission'
-  [7] 'Title Number'
+  [6] 'Applicant Name'
+  [7] 'Commission'
+  [8] 'Title Number'
 
 Correct output:
 {
@@ -149,16 +164,18 @@ Correct output:
   "property_number": ">0",
   "price": "2",
   "withdrawn_date": "3",
-  "client_name": "5",
-  "commission": "6",
-  "title_number": "7",
+  "vendor_name": "5",
+  "client_name": "6",
+  "commission": "7",
+  "title_number": "8",
   "contract_duration": null
 }
 
 Note: 'Property Address' header implies the column holds a full address string, so
       postcode/region/county all use ">0".  Dedicated columns like 'Asking Price'
       use a bare index because the cell will contain just the value.
-      title_number maps to "7" because the header is explicitly named 'Title Number'.
+      'Vendor Name' maps to vendor_name (seller), never to client_name.  'Applicant Name' maps to
+      client_name (buyer).  title_number maps to "8" because the header is explicitly named 'Title Number'.
 ──────────────────────────────────────────────────────────────────────────────
 """
 
@@ -214,6 +231,49 @@ _RE_EXTRACT = re.compile(r"^>(\d+)$")
 _RE_CONCAT = re.compile(r"^(\d+)(\+\d+)+$")
 _RE_DIRECT = re.compile(r"^(\d+)\??$")
 
+# Column headers that explicitly indicate the purchasing party (client_name is allowed).
+_BUYER_IN_HEADER_RE = re.compile(
+    r"\b(buyers?|purchasers?|applicants?|prospects?|purchasing|introduced\s+party)\b",
+    re.IGNORECASE,
+)
+# Headers that refer to the selling party — must map to vendor_name, not client_name.
+_SELLER_IN_HEADER_RE = re.compile(
+    r"\b(vendors?|sellers?|landlords?|lessors?)\b",
+    re.IGNORECASE,
+)
+# Ambiguous CRM labels (often the vendor) — do not map to client_name without a buyer qualifier.
+_AMBIGUOUS_NAME_HEADER_RE = re.compile(
+    r"^(client|client\s+name|name|contact|contact\s+name)(\s+\d+)?$",
+    re.IGNORECASE,
+)
+
+
+def _header_implies_seller_not_buyer(header: Optional[str]) -> bool:
+    """True when this column header must not be the sole source for client_name (buyer-only)."""
+    if not header or not str(header).strip():
+        return False
+    h = str(header).strip().lower()
+    if _BUYER_IN_HEADER_RE.search(h):
+        return False
+    if _SELLER_IN_HEADER_RE.search(h):
+        return True
+    if _AMBIGUOUS_NAME_HEADER_RE.match(h.strip()):
+        return True
+    return False
+
+
+def _client_name_mapped_indices(instr: str) -> List[int]:
+    """Column indices referenced by a client_name DSL value (direct or concat; skip '>N')."""
+    s = str(instr).strip().rstrip("?")
+    if _RE_EXTRACT.match(s):
+        return []
+    if _RE_CONCAT.match(s):
+        return [int(i) for i in s.split("+")]
+    m2 = _RE_DIRECT.match(s)
+    if m2:
+        return [int(m2.group(1))]
+    return []
+
 
 def _parse_instr(instr: str):
     """Return (indices, is_extract) from a DSL value string; ([], False) if unrecognised."""
@@ -232,6 +292,7 @@ def _parse_instr(instr: str):
 def _deterministic_review(
     mapping: Dict[str, Any],
     sample_row: List[str],
+    header_row: Optional[List[str]] = None,
 ) -> tuple[bool, Optional[str]]:
     """
     Validate a DSL mapping against the sample row using hard coded rules.
@@ -285,6 +346,20 @@ def _deterministic_review(
                     f"in the row ('{cell[:60]}')"
                 )
                 break
+
+    # Rule 5 — client_name must not reference vendor-only or ambiguous name headers
+    client_instr = mapping.get("client_name")
+    if client_instr is not None and header_row:
+        for idx in _client_name_mapped_indices(str(client_instr)):
+            if 0 <= idx < len(header_row):
+                hdr = header_row[idx]
+                if _header_implies_seller_not_buyer(hdr):
+                    issues.append(
+                        f"'client_name' maps column {idx} ({hdr!r}) but the header suggests seller "
+                        f"or ambiguous CRM labelling — use vendor_name for that column and set "
+                        f"client_name to null unless a column explicitly indicates the purchaser "
+                        f"(buyer, applicant, prospect, purchaser, etc.)"
+                    )
 
     if issues:
         critique = "; ".join(issues)
@@ -507,7 +582,9 @@ def _reviewer_node(state: AgentState, _model) -> Dict[str, Any]:
         len(mapping),
     )
 
-    approved, critique = _deterministic_review(mapping, sample_row)
+    approved, critique = _deterministic_review(
+        mapping, sample_row, state.get("header_row")
+    )
 
     if approved:
         logger.info("Reviewer approved mapping")

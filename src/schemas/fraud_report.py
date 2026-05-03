@@ -25,7 +25,8 @@ class FraudMatchSchema(BaseModel):
                 "id": "770e8400-e29b-41d4-a716-446655440002",
                 "property_listing_id": "880e8400-e29b-41d4-a716-446655440003",
                 "property_address": "123 High Street, London",
-                "client_name": "John Smith",
+                "client_name": "Jane Buyer",
+                "vendor_name": "John Vendor",
                 "withdrawn_date": "2025-01-15T00:00:00",
                 "ppd_transaction_id": "{ABC123-DEF456}",
                 "ppd_price": 450000,
@@ -48,7 +49,12 @@ class FraudMatchSchema(BaseModel):
 
     # Property details
     property_address: str = Field(..., description="Agency property address")
-    client_name: str = Field(..., description="Agency client name")
+    client_name: Optional[str] = Field(
+        None, description="Buyer / introduced party name when captured"
+    )
+    vendor_name: Optional[str] = Field(
+        None, description="Seller / vendor name from agency listing when captured"
+    )
     withdrawn_date: Optional[datetime] = Field(
         None, description="Date property was withdrawn"
     )

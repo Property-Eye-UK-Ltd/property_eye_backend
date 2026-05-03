@@ -22,7 +22,8 @@ class ListingsIngestRequest(BaseModel):
                 "record": {
                     "address": "8 Woodstock, Brookfield Lane West, Cheshunt, Waltham Cross, Hertfordshire, EN8 0QH",
                     "postcode": "EN8 0QH",
-                    "client_name": "Nina Baum",
+                    "client_name": "Alex Purchaser",
+                    "vendor_name": "Nina Vendor",
                     "withdrawn_date": "09/07/2022",
                 },
             }

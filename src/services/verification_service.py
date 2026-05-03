@@ -39,15 +39,6 @@ def _effective_postcode_for_lr(listing: PropertyListing, ppd_postcode: str) -> s
     return (ppd_postcode or "").strip()
 
 
-def _verification_street_address(listing: PropertyListing) -> str:
-    """Build free-form address for OOV (include property number when not in line)."""
-    base = listing.address or ""
-    pn = getattr(listing, "property_number", None)
-    if pn and str(pn).strip():
-        pns = str(pn).strip()
-        if pns.upper() not in base.upper():
-            return f"{pns} {base}".strip()
-    return base
 
 
 class VerificationService:
@@ -148,6 +139,7 @@ class VerificationService:
                 match_id=match_id,
                 property_address="Unknown",
                 client_name="Unknown",
+                vendor_name=None,
                 verification_status="error",
                 verified_owner_name=None,
                 is_confirmed_fraud=False,
@@ -164,15 +156,10 @@ class VerificationService:
                 if getattr(property_listing, "title_number", None)
                 else ""
             )
-            verify_addr = _verification_street_address(property_listing)
             verify_pc = _effective_postcode_for_lr(
                 property_listing, fraud_match.ppd_postcode or ""
             )
-            town = (
-                (property_listing.region or "").strip()
-                if getattr(property_listing, "region", None)
-                else ""
-            ) or None
+            town = (property_listing.region or "").strip() or None
 
             pc_src = (
                 "listing"
@@ -188,19 +175,20 @@ class VerificationService:
                 "Verifying match %s: mode=%s listing_addr_len=%s postcode_source=%s town_set=%s",
                 match_id,
                 "title_number" if title_no else "address",
-                len(verify_addr or ""),
+                len(property_listing.address or ""),
                 pc_src,
                 bool(town),
             )
 
             # Call Land Registry API (prefer listing + title; fall back to PPD address if empty)
             api_result = await self.land_registry_client.verify_ownership(
-                property_address=verify_addr or fraud_match.ppd_full_address,
+                property_address=property_listing.address or fraud_match.ppd_full_address,
                 postcode=verify_pc or fraud_match.ppd_postcode,
                 expected_owner_name=property_listing.client_name,
                 message_id=fraud_match.ppd_transaction_id,
                 title_number=title_no or None,
                 town=town,
+                building_name_or_number=property_listing.property_number,
             )
 
             # Store API response
@@ -230,6 +218,7 @@ class VerificationService:
                     match_id=match_id,
                     property_address=property_listing.address,
                     client_name=property_listing.client_name,
+                    vendor_name=property_listing.vendor_name,
                     verification_status="error",
                     verified_owner_name=None,
                     is_confirmed_fraud=False,
@@ -249,6 +238,7 @@ class VerificationService:
                     match_id=match_id,
                     property_address=property_listing.address,
                     client_name=property_listing.client_name,
+                    vendor_name=property_listing.vendor_name,
                     verification_status="not_fraud",
                     verified_owner_name=None,
                     is_confirmed_fraud=False,
@@ -278,6 +268,7 @@ class VerificationService:
                 match_id=match_id,
                 property_address=property_listing.address,
                 client_name=property_listing.client_name,
+                vendor_name=property_listing.vendor_name,
                 verification_status=fraud_match.verification_status,
                 verified_owner_name=fraud_match.verified_owner_name,
                 is_confirmed_fraud=fraud_match.is_confirmed_fraud,
@@ -297,6 +288,7 @@ class VerificationService:
                 match_id=match_id,
                 property_address=property_listing.address,
                 client_name=property_listing.client_name,
+                vendor_name=property_listing.vendor_name,
                 verification_status="error",
                 verified_owner_name=None,
                 is_confirmed_fraud=False,
@@ -321,13 +313,8 @@ class VerificationService:
             if getattr(listing, "title_number", None)
             else ""
         )
-        verify_addr = _verification_street_address(listing)
         verify_pc = _effective_postcode_for_lr(listing, "")
-        town = (
-            (listing.region or "").strip()
-            if getattr(listing, "region", None)
-            else ""
-        ) or None
+        town = (listing.region or "").strip() or None
 
         pc_src = (
             "listing"
@@ -342,18 +329,19 @@ class VerificationService:
             "Direct HMLR verify listing %s: mode=%s listing_addr_len=%s postcode_source=%s town_set=%s",
             listing.id,
             "title_number" if title_no else "address",
-            len(verify_addr or ""),
+            len(listing.address or ""),
             pc_src,
             bool(town),
         )
 
         api_result = await self.land_registry_client.verify_ownership(
-            property_address=verify_addr,
+            property_address=listing.address,
             postcode=verify_pc,
             expected_owner_name=listing.client_name or "",
             message_id=listing.id,
             title_number=title_no or None,
             town=town,
+            building_name_or_number=listing.property_number,
         )
 
         verified_at = datetime.utcnow()
@@ -364,6 +352,7 @@ class VerificationService:
                 match_id=listing.id,
                 property_address=listing.address,
                 client_name=client_name,
+                vendor_name=listing.vendor_name,
                 verification_status="error",
                 verified_owner_name=None,
                 is_confirmed_fraud=False,
@@ -376,6 +365,7 @@ class VerificationService:
                 match_id=listing.id,
                 property_address=listing.address,
                 client_name=client_name,
+                vendor_name=listing.vendor_name,
                 verification_status="not_fraud",
                 verified_owner_name=None,
                 is_confirmed_fraud=False,
@@ -389,6 +379,7 @@ class VerificationService:
             match_id=listing.id,
             property_address=listing.address,
             client_name=client_name,
+            vendor_name=listing.vendor_name,
             verification_status=status,
             verified_owner_name=api_result.owner_name,
             is_confirmed_fraud=is_match,

@@ -178,6 +178,7 @@ class FraudDetector:
                 property_listing_id=m.property_listing_id,
                 property_address=m.property_listing.address,
                 client_name=m.property_listing.client_name,
+                vendor_name=m.property_listing.vendor_name,
                 withdrawn_date=m.property_listing.withdrawn_date,
                 ppd_transaction_id=m.ppd_transaction_id,
                 ppd_price=m.ppd_price,

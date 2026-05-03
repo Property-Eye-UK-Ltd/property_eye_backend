@@ -125,6 +125,16 @@ class LandRegistryClient:
                     raw_body=None,
                 )
 
+            if request.address:
+                addr = request.address
+                logger.info(
+                    "OOV address fields: building=%s street=%s town=%s postcode=%s",
+                    addr.building_name_or_number,
+                    addr.street or "",
+                    addr.town or "",
+                    addr.postcode or "",
+                )
+
             logger.info(
                 "HMLR OOV POST %s ref=%s soap_bytes=%s",
                 self._oov_path,
@@ -198,6 +208,7 @@ class LandRegistryClient:
         message_id: Optional[str] = None,
         title_number: Optional[str] = None,
         town: Optional[str] = None,
+        building_name_or_number: Optional[str] = None,
     ) -> OwnershipVerificationResult:
         """
         High-level ownership verification using OOV behind the scenes.
@@ -207,10 +218,11 @@ class LandRegistryClient:
         """
         use_title = bool(title_number and str(title_number).strip())
         logger.info(
-            "OOV verify_ownership mode=%s postcode_present=%s town_present=%s address_len=%s",
+            "OOV verify_ownership mode=%s postcode_present=%s town_present=%s building_present=%s address_len=%s",
             "title_number" if use_title else "address",
             bool((postcode or "").strip()),
             bool((town or "").strip()),
+            bool((building_name_or_number or "").strip()),
             len((property_address or "").strip()),
         )
 
@@ -234,7 +246,24 @@ class LandRegistryClient:
             )
 
         # Build a minimal OOV request from the flat address and expected owner name.
-        building_part, street_part = self._split_address(property_address)
+        clean_addr = (property_address or "").strip().rstrip(",").strip()
+
+        # Extract building and street parts. Prefer explicit building name/number if provided.
+        if building_name_or_number and building_name_or_number.strip():
+            building_part = building_name_or_number.strip()
+            # If the building part is already at the start of the address string, 
+            # remove it to extract only the street part.
+            if clean_addr.upper().startswith(building_part.upper()):
+                # Remove building part + optional comma/space
+                street_part = re.sub(
+                    f"^{re.escape(building_part)}\\s*,?\\s*", 
+                    "", clean_addr, flags=re.IGNORECASE
+                ).strip()
+            else:
+                street_part = clean_addr
+        else:
+            building_part, street_part = self._split_address(clean_addr)
+            
         person_forename, person_surname = self._split_name(expected_owner_name)
 
         if not (person_forename and person_surname) and not self._is_test_mode:
@@ -251,10 +280,13 @@ class LandRegistryClient:
                 },
             )
 
+        # Ensure town is within schema length limits
+        final_town = town.strip()[:35] if town and town.strip() else None
+
         address = OovAddress(
             building_name_or_number=building_part,
             street=street_part,
-            town=(town.strip()[:35] if town and town.strip() else None),
+            town=final_town,
             postcode=self._normalise_uk_postcode(postcode) or None,
         )
 
@@ -867,10 +899,24 @@ class LandRegistryClient:
         """Split a free-form address into building number/name and street."""
         if not full_address:
             return "", ""
-        parts = full_address.strip().split(" ", 1)
+        
+        # Normalize whitespace and strip
+        addr = re.sub(r"\s+", " ", full_address.strip())
+        
+        # 1. Try splitting by comma first (e.g. "Woodstock, Brookfield Lane West")
+        if "," in addr:
+            parts = [p.strip() for p in addr.split(",", 1)]
+            building = parts[0].strip(",")
+            street = parts[1].strip(",")
+            if building and street:
+                return building, street
+        
+        # 2. Try splitting on first space (e.g. "10 Brookfield Lane West")
+        parts = addr.split(" ", 1)
         if len(parts) == 1:
-            return parts[0], ""
-        return parts[0], parts[1]
+            return parts[0].strip(","), ""
+        
+        return parts[0].strip(","), parts[1].strip(",")
 
     def _split_name(self, full_name: str) -> tuple[Optional[str], Optional[str]]:
         """Split a full name into simple forename and surname."""

@@ -138,6 +138,7 @@ async def get_verification_status(
             match_id=match_id,
             property_address=property_listing.address,
             client_name=property_listing.client_name,
+            vendor_name=property_listing.vendor_name,
             verification_status=fraud_match.verification_status,
             verified_owner_name=fraud_match.verified_owner_name,
             is_confirmed_fraud=fraud_match.is_confirmed_fraud,

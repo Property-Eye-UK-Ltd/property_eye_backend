@@ -159,7 +159,8 @@ async def import_alto_properties(
                     postcode=postcode,
                     region=alto_town,
                     county=alto_county,
-                    client_name="Alto Import",  # Default since Alto doesn't provide client name
+                    client_name="Alto Import",  # Placeholder until Alto exposes buyer vs vendor
+                    vendor_name=None,
                     status=property_status,
                     withdrawn_date=None,  # Could parse from updated_at if status is withdrawn
                 )

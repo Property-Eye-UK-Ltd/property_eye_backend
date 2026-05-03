@@ -44,7 +44,12 @@ class VerificationResult(BaseModel):
 
     match_id: str = Field(..., description="Fraud match ID")
     property_address: str = Field(..., description="Property address")
-    client_name: str = Field(..., description="Agency client name")
+    client_name: Optional[str] = Field(
+        None, description="Buyer / introduced party name from agency listing when present"
+    )
+    vendor_name: Optional[str] = Field(
+        None, description="Seller / vendor name from agency listing when present"
+    )
 
     verification_status: str = Field(
         ..., description="Verification status: confirmed_fraud, not_fraud, or error"
@@ -63,7 +68,8 @@ class VerificationResult(BaseModel):
             "example": {
                 "match_id": "770e8400-e29b-41d4-a716-446655440002",
                 "property_address": "123 High Street, London",
-                "client_name": "John Smith",
+                "client_name": "Jane Buyer",
+                "vendor_name": "John Vendor",
                 "verification_status": "confirmed_fraud",
                 "verified_owner_name": "John Smith",
                 "is_confirmed_fraud": True,

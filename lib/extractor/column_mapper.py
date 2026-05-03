@@ -26,6 +26,7 @@ CANONICAL_FIELDS: List[str] = [
     "price",
     "commission",
     "client_name",
+    "vendor_name",
     "contract_duration",
     "title_number",
 ]

@@ -13,12 +13,18 @@ class FieldMappingSchema(BaseModel):
     """
     Schema for field mapping dictionary.
 
-    Maps agency document column names to system-required field names.
+    Maps agency document column names to system field names.
+
+    Use client_name only when the source column explicitly means the purchaser /
+    applicant / buyer (not the vendor). "Client Full Name" in many UK exports is
+    the selling client — map that to vendor_name unless your file clearly labels
+    the buying party.
 
     Example:
         {
             "Property Address": "address",
-            "Client Full Name": "client_name",
+            "Vendor Name": "vendor_name",
+            "Applicant Name": "client_name",
             "Status": "status",
             "Date Withdrawn": "withdrawn_date",
             "Postcode": "postcode"
@@ -30,7 +36,8 @@ class FieldMappingSchema(BaseModel):
             "example": {
                 "mapping": {
                     "Property Address": "address",
-                    "Client Full Name": "client_name",
+                    "Vendor Name": "vendor_name",
+                    "Applicant Name": "client_name",
                     "Status": "status",
                     "Date Withdrawn": "withdrawn_date",
                     "Postcode": "postcode",

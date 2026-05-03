@@ -34,11 +34,11 @@ class FraudDetectionConfig:
     DATE_PROXIMITY_WEIGHT: float = 0.20  # 20% weight for date proximity
     POSTCODE_MATCH_WEIGHT: float = 0.10  # 10% weight for postcode match
 
-    # Required Fields for Agency Document Upload
+    # Required Fields for legacy document parser (mapped DataFrame columns)
+    # Buyer client_name is optional — many exports only carry vendor/seller names.
     REQUIRED_FIELDS: List[str] = field(
         default_factory=lambda: [
             "address",
-            "client_name",
             "status",
             "withdrawn_date",
             "postcode",

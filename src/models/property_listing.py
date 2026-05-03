@@ -27,7 +27,8 @@ class PropertyListing(Base):
         county: County
         property_number: House/flat/plot number
         title_number: Land Registry title number if present
-        client_name: Name of the client associated with the property
+        client_name: Buyer / purchaser / applicant name when explicitly captured (nullable)
+        vendor_name: Seller / vendor / landlord name when captured (nullable)
         status: Property status (withdrawn, active, sold, etc.)
         withdrawn_date: Date when property was withdrawn
         price: Listing price amount
@@ -51,7 +52,8 @@ class PropertyListing(Base):
     county = Column(String, nullable=True)
     property_number = Column(String, nullable=True)
     title_number = Column(String, nullable=True, index=True)
-    client_name = Column(String)
+    client_name = Column(String, nullable=True)
+    vendor_name = Column(String, nullable=True)
     status = Column(String, index=True)  # withdrawn, active, sold, etc.
     withdrawn_date = Column(DateTime, nullable=True)
     price = Column(String, nullable=True)

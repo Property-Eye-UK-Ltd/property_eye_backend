@@ -88,7 +88,7 @@ FIELD_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
-        "client_name",
+        "vendor_name",
         re.compile(
             r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
         ),
@@ -227,8 +227,8 @@ def _classify_parts_to_row(parts: List[str]) -> Dict[str, Any]:
         elif len(part.split(",")) > 2:
             row.setdefault("address", part)
 
-    if "client_name" in row:
-        row.setdefault("seller", row["client_name"])
+    if "vendor_name" in row:
+        row.setdefault("seller", row["vendor_name"])
 
     return _finalize_row(row)
 
