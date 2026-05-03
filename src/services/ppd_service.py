@@ -148,7 +148,7 @@ class PPDService:
         summary = IngestionSummary()
 
         try:
-            logger.info(f"Starting PPD ingestion from {csv_path}")
+            logger.info(f"[Ingestion] Starting PPD ingestion from {csv_path}")
 
             # Read CSV
             df = pd.read_csv(
@@ -159,7 +159,7 @@ class PPDService:
             )
 
             total_records = len(df)
-            logger.info(f"Read {total_records} records from CSV")
+            logger.info(f"[Ingestion] Read {total_records} records from CSV")
 
             # Add derived columns
             df["full_address"] = df.apply(self._build_full_address, axis=1)
@@ -175,7 +175,7 @@ class PPDService:
             invalid_count = total_records - len(valid_df)
 
             if invalid_count > 0:
-                logger.warning(f"Dropped {invalid_count} invalid records")
+                logger.warning(f"[Ingestion] Dropped {invalid_count} invalid records")
                 summary.failed = invalid_count
                 summary.errors.append(
                     f"{invalid_count} records missing required fields"
@@ -196,11 +196,11 @@ class PPDService:
 
             summary.successful = len(valid_df)
             logger.info(
-                f"Successfully ingested {summary.successful} records to {parquet_path}"
+                f"[Ingestion] Successfully ingested {summary.successful} records to {parquet_path}"
             )
 
         except Exception as e:
-            error_msg = f"Failed to ingest PPD data: {str(e)}"
+            error_msg = f"[Ingestion] Failed to ingest PPD data: {str(e)}"
             logger.error(error_msg)
             summary.errors.append(error_msg)
             summary.failed = summary.failed or 0
@@ -243,10 +243,13 @@ class PPDService:
         for prop in properties:
             wd = _withdrawn_as_date(prop.withdrawn_date)
             if wd:
-                if min_date is None or wd < min_date:
-                    min_date = wd
+                # Look back 3 months (few months before)
+                start_date = wd - timedelta(days=3 * 30)
+                if min_date is None or start_date < min_date:
+                    min_date = start_date
 
-                end_date = wd + timedelta(days=scan_window * 30)
+                # Look forward 5 years (lots of years after)
+                end_date = wd + timedelta(days=60 * 30)
                 if max_date is None or end_date > max_date:
                     max_date = end_date
             else:
@@ -279,7 +282,7 @@ class PPDService:
             """
         else:
             logger.warning(
-                "PPD query: no withdrawal dates on listings — omitting date filter "
+                "[DuckDB Scan] No withdrawal dates on listings — omitting date filter "
                 "(scan may be broad). Listings missing date: %s",
                 props_without_date,
             )
@@ -319,21 +322,27 @@ class PPDService:
 
         try:
             logger.info(
-                "PPD DuckDB scan: listings=%s date_window=%s..%s postcode_prefixes=%s "
-                "towns=%s counties=%s",
-                len(properties),
-                min_date.isoformat() if min_date else None,
-                max_date.isoformat() if max_date else None,
-                sorted(postcodes) if postcodes else [],
-                list(towns) if towns else [],
-                list(counties) if counties else [],
+                "[DuckDB Scan] Initializing scan for %s listings using Parquet/DuckDB",
+                len(properties)
             )
-            logger.debug("PPD DuckDB SQL: %s", query)
+            logger.info(
+                "[DuckDB Scan] Filters: dates=[%s to %s], postcode_prefixes=%s, towns=%s, counties=%s",
+                min_date.isoformat() if min_date else "N/A",
+                max_date.isoformat() if max_date else "N/A",
+                sorted(postcodes) if postcodes else "None",
+                list(towns) if towns else "None",
+                list(counties) if counties else "None",
+            )
+            
             result_df = self.duckdb_conn.execute(query).fetchdf()
-            logger.info("PPD query returned %s candidate row(s)", len(result_df))
+            
+            logger.info(
+                "[DuckDB Scan] Complete. Found %s candidate PPD records in storage volume.",
+                len(result_df)
+            )
             return result_df
         except Exception as e:
-            logger.error(f"DuckDB query failed: {str(e)}")
+            logger.error(f"[DuckDB Scan] Query failed: {str(e)}")
             return pd.DataFrame()
 
     def _get_parquet_path(self, year: int) -> Path:

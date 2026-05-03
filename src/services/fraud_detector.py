@@ -1,16 +1,16 @@
 """
 Fraud detector service for Stage 1: Suspicious Match Detection.
 
-Compares withdrawn properties against PPD data to identify potential fraud cases.
+Compiles withdrawn properties against PPD data to identify potential fraud cases.
 """
 
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.fraud_match import FraudMatch
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _COUNTY_BONUS_CAP = 5.0
 _PRICE_BONUS_CAP = 5.0
+_TITLE_NUMBER_MATCH_SCORE = 100.0
 
 
 def _as_date(val) -> Optional[date]:
@@ -84,33 +85,30 @@ class FraudDetector:
     ) -> SuspiciousMatchSummary:
         """
         Stage 1: Detect suspicious matches without Land Registry calls.
-
-        Steps:
-        1. Get all withdrawn properties for agency
-        2. Query PPD Parquet files via DuckDB with date/postcode filters
-        3. Compare addresses and calculate confidence scores
-        4. Store all matches with status="suspicious"
-        5. Return summary with match counts and confidence distribution
-
-        Args:
-            agency_id: Agency identifier
-            db: Database session
-
-        Returns:
-            SuspiciousMatchSummary with all detected matches
         """
-        logger.info(f"Starting fraud detection for agency {agency_id}")
+        logger.info(f"[Fraud Detection] Starting scan for agency: {agency_id}")
 
-        # Get all withdrawn properties for agency
+        # Get total count and unique statuses for debugging
+        total_stmt = select(func.count(PropertyListing.id)).where(PropertyListing.agency_id == agency_id)
+        status_stmt = select(PropertyListing.status).where(PropertyListing.agency_id == agency_id).distinct()
+        
+        total_count = (await db.execute(total_stmt)).scalar() or 0
+        status_results = (await db.execute(status_stmt)).scalars().all()
+        unique_statuses = [s for s in status_results if s is not None]
+
+        # Get withdrawn properties
         stmt = select(PropertyListing).where(
             PropertyListing.agency_id == agency_id,
-            PropertyListing.status == "withdrawn",
+            or_(
+                func.lower(PropertyListing.status).in_(["withdrawn", "withdrawn date", "withdrawn_date"]),
+                PropertyListing.withdrawn_date.isnot(None)
+            ),
         )
         result = await db.execute(stmt)
         properties = result.scalars().all()
 
         if not properties:
-            logger.info(f"No withdrawn properties found for agency {agency_id}")
+            logger.warning(f"[Fraud Detection] No withdrawn properties found for agency {agency_id}.")
             return SuspiciousMatchSummary(
                 total_matches=0,
                 confidence_distribution=ConfidenceDistribution(
@@ -120,58 +118,40 @@ class FraudDetector:
                 message="No withdrawn properties found for fraud detection",
             )
 
-        logger.info(
-            "Found %s withdrawn properties (rich fields: title=%s price=%s region=%s)",
-            len(properties),
-            sum(1 for p in properties if getattr(p, "title_number", None)),
-            sum(1 for p in properties if getattr(p, "price", None)),
-            sum(1 for p in properties if getattr(p, "region", None)),
-        )
+        logger.info("[Fraud Detection] Analyzing %s withdrawn properties", len(properties))
 
         # Query PPD data via DuckDB
         ppd_df = self.ppd_service.query_ppd_for_properties(properties)
 
         if ppd_df.empty:
-            logger.info("No PPD records found in date/postcode range")
+            logger.info("[Fraud Detection] No PPD records found in candidate window")
             return SuspiciousMatchSummary(
                 total_matches=0,
                 confidence_distribution=ConfidenceDistribution(
                     high_confidence=0, medium_confidence=0, low_confidence=0
                 ),
                 matches=[],
-                message="No PPD records found matching the date and postcode criteria",
+                message="No PPD records found matching criteria",
             )
 
-        logger.info(f"Found {len(ppd_df)} PPD records to compare")
+        if 'transfer_date' in ppd_df.columns:
+            ppd_df['transfer_date_dt'] = pd.to_datetime(ppd_df['transfer_date'])
 
         # Match properties against PPD data
         all_matches = []
         for prop in properties:
-            matches = await self._match_property_to_ppd(prop, ppd_df, db)
+            # MULTI-MATCH: We return all valid matches for transparency, 
+            # but apply strict geographic boundaries to prevent cross-town noise.
+            matches = await self._match_property_to_ppd_multi(prop, ppd_df, db)
             all_matches.extend(matches)
 
-        logger.info(f"Detected {len(all_matches)} suspicious matches")
+        logger.info("[Fraud Detection] Scan complete. Detected %s suspicious matches.", len(all_matches))
 
-        # Calculate confidence distribution
-        high_confidence = sum(
-            1
-            for m in all_matches
-            if m.confidence_score >= config.HIGH_CONFIDENCE_THRESHOLD
-        )
-        medium_confidence = sum(
-            1
-            for m in all_matches
-            if config.MIN_CONFIDENCE_THRESHOLD
-            <= m.confidence_score
-            < config.HIGH_CONFIDENCE_THRESHOLD
-        )
-        low_confidence = sum(
-            1
-            for m in all_matches
-            if m.confidence_score < config.MIN_CONFIDENCE_THRESHOLD
-        )
+        # Distribution and Schemas
+        high_confidence = sum(1 for m in all_matches if m.confidence_score >= config.HIGH_CONFIDENCE_THRESHOLD)
+        medium_confidence = sum(1 for m in all_matches if config.MIN_CONFIDENCE_THRESHOLD <= m.confidence_score < config.HIGH_CONFIDENCE_THRESHOLD)
+        low_confidence = sum(1 for m in all_matches if m.confidence_score < config.MIN_CONFIDENCE_THRESHOLD)
 
-        # Convert to schemas
         match_schemas = [
             FraudMatchSchema(
                 id=m.id,
@@ -205,72 +185,145 @@ class FraudDetector:
                 low_confidence=low_confidence,
             ),
             matches=match_schemas,
-            message=f"Stage 1 complete: {len(all_matches)} suspicious matches detected. "
-            f"Review {high_confidence} high-confidence matches for Land Registry verification.",
+            message=f"Stage 1 complete: {len(all_matches)} matches detected. Geographic noise filtered.",
         )
 
-    async def _match_property_to_ppd(
+    async def _match_property_to_ppd_multi(
         self, property: PropertyListing, ppd_dataframe: pd.DataFrame, db: AsyncSession
     ) -> List[FraudMatch]:
         """
-        Compare property against PPD DataFrame.
-
-        Args:
-            property: PropertyListing to match
-            ppd_dataframe: DataFrame with PPD records
-            db: Database session
-
-        Returns:
-            List of FraudMatch objects above MIN_CONFIDENCE_THRESHOLD
+        Match property against PPD and return ALL valid matches for transparency.
+        
+        Strictness:
+        - Must share outward postcode (e.g. EN10) or Town.
+        - Cross-town matches (different outward postcode) are REJECTED unless address is >98% match.
         """
-        matches = []
+        prop_pc = (property.postcode or "").strip().upper()
+        # Determine if we have a full postcode (e.g. "EN10 6PX") or just outward (e.g. "EN10")
+        has_full_postcode = " " in prop_pc
+        outward_pc = prop_pc.split()[0] if has_full_postcode else prop_pc[:4]
+        prop_town = (property.region or "").strip().lower()
+        
+        candidates = ppd_dataframe
+        
+        # 1. Geographic Filter — narrow to outward postcode or town first
+        if outward_pc:
+            candidates = candidates[candidates['postcode'].str.startswith(outward_pc, na=False)]
+        elif prop_town:
+            candidates = ppd_dataframe[
+                (ppd_dataframe['town'].str.lower() == prop_town) | 
+                (ppd_dataframe['locality'].str.lower() == prop_town)
+            ]
 
-        # Normalize property address (reuse stored normalized_address when present)
+        if candidates.empty:
+            return []
+
+        # 1b. STRICT POSTCODE MATCH — if the listing has a full postcode, require exact match.
+        #     Postcodes do not change when a property is sold. A different full postcode means
+        #     a physically different house, even if the street name looks similar.
+        if has_full_postcode:
+            exact_match = candidates[candidates['postcode'].str.upper() == prop_pc]
+            if not exact_match.empty:
+                # Prefer exact-postcode candidates. Only fall back if we have nothing.
+                candidates = exact_match
+            else:
+                # Listing postcode not found in PPD — could be a data entry error.
+                # Log and skip — don't let cross-postcode noise through.
+                logger.debug(
+                    "[Fuzzy Matching] No exact postcode match for %s (%s) in PPD. Skipping.",
+                    property.address[:40], prop_pc
+                )
+                return []
+
+        # 2. Date Filter (3 months before to 5 years after)
+        wd = _as_date(property.withdrawn_date)
+        if wd:
+            start_date = pd.Timestamp(wd - timedelta(days=3 * 30))
+            end_date = pd.Timestamp(wd + timedelta(days=60 * 30))
+            if 'transfer_date_dt' in candidates.columns:
+                candidates = candidates[
+                    (candidates['transfer_date_dt'] >= start_date) & 
+                    (candidates['transfer_date_dt'] <= end_date)
+                ]
+
+        if candidates.empty:
+            return []
+
+        # 3. Fuzzy Matching — candidates are now guaranteed to be the same postcode
+        matches = []
+        prop_num = str(property.property_number).strip().upper() if property.property_number else ""
+        if not prop_num and property.address:
+            m = re.match(r"^(\d+)", property.address.strip())
+            if m: prop_num = m.group(1)
+
         base_addr = property.address or ""
-        if getattr(property, "property_number", None) and str(
-            property.property_number
-        ).strip():
-            pn = str(property.property_number).strip().upper()
-            if pn and pn not in base_addr.upper():
-                base_addr = f"{property.property_number} {base_addr}".strip()
+        if prop_num and prop_num not in base_addr.upper():
+            base_addr = f"{property.property_number} {base_addr}".strip()
 
         prop_normalized = property.normalized_address or self.address_normalizer.normalize(
             base_addr, property.postcode
         )
 
-        # Compare against each PPD record
-        for _, ppd_row in ppd_dataframe.iterrows():
-            # Calculate address similarity
-            ppd_normalized = ppd_row.get("normalized_address", "")
-            address_similarity = self.address_normalizer.calculate_similarity(
-                prop_normalized, ppd_normalized
-            )
+        for _, ppd_row in candidates.iterrows():
+            ppd_norm = str(ppd_row.get("normalized_address", ""))
+            address_similarity = self.address_normalizer.calculate_similarity(prop_normalized, ppd_norm)
 
-            # Skip if below minimum threshold
-            if address_similarity < config.MIN_ADDRESS_SIMILARITY:
+            paon_match = False
+            ppd_paon = str(ppd_row.get("paon", "")).strip().upper()
+            if prop_num and prop_num == ppd_paon:
+                paon_match = True
+                address_similarity = min(100.0, address_similarity + 15.0)
+
+            ppd_pc = str(ppd_row.get("postcode", "")).strip().upper()
+
+            if address_similarity < config.MIN_ADDRESS_SIMILARITY and not paon_match:
                 continue
 
-            # Calculate confidence score
-            confidence_score = self._calculate_confidence_score(
-                property, ppd_row, address_similarity
-            )
+            confidence_score = self._calculate_confidence_score(property, ppd_row, address_similarity)
 
-            # Calculate risk level
-            risk_level = "LOW"
-            wd = _as_date(property.withdrawn_date)
-            if wd and pd.notna(ppd_row.get("transfer_date")):
-                ppd_date = pd.to_datetime(ppd_row["transfer_date"]).date()
-                days_diff = abs((ppd_date - wd).days)
-                risk_level = self._calculate_risk_level(days_diff, confidence_score)
-
-            # Store if above minimum confidence threshold
             if confidence_score >= config.MIN_CONFIDENCE_THRESHOLD:
+                risk_level = "LOW"
+                ppd_transfer_date_val = None
+                days_diff = None
+                if wd and pd.notna(ppd_row.get("transfer_date")):
+                    ppd_date = pd.to_datetime(ppd_row["transfer_date"]).date()
+                    ppd_transfer_date_val = ppd_date
+                    days_diff = (ppd_date - wd).days  # signed: positive = sold AFTER withdrawal
+                    risk_level = self._calculate_risk_level(abs(days_diff), confidence_score)
+
+                # --- MATCH FOUND: Log side-by-side comparison for review ---
+                logger.info(
+                    "[Match Found] ══════════════════════════════════════════\n"
+                    "  AGENCY LISTING:\n"
+                    "    Address   : %s\n"
+                    "    Postcode  : %s\n"
+                    "    Withdrawn : %s\n"
+                    "    Price     : %s\n"
+                    "  PPD RECORD (Land Registry):\n"
+                    "    Address   : %s\n"
+                    "    Postcode  : %s\n"
+                    "    Sold On   : %s\n"
+                    "    Price     : £%s\n"
+                    "    Txn ID    : %s\n"
+                    "  SCORES:\n"
+                    "    Address Similarity : %.1f%%\n"
+                    "    Confidence Score   : %.1f%%\n"
+                    "    Risk Level         : %s\n"
+                    "    Days from Withdrawal to Sale: %s (+ = after, - = before)\n"
+                    "══════════════════════════════════════════",
+                    property.address, property.postcode, wd, property.price,
+                    ppd_row.get("full_address", "N/A"), ppd_pc,
+                    ppd_transfer_date_val, ppd_row.get("price", 0),
+                    ppd_row.get("transaction_id", "N/A"),
+                    address_similarity, confidence_score, risk_level, days_diff,
+                )
+
                 fraud_match = FraudMatch(
                     property_listing_id=property.id,
                     ppd_transaction_id=str(ppd_row.get("transaction_id", "")),
                     ppd_price=int(ppd_row.get("price", 0)),
                     ppd_transfer_date=pd.to_datetime(ppd_row.get("transfer_date")),
-                    ppd_postcode=str(ppd_row.get("postcode", "")),
+                    ppd_postcode=ppd_pc,
                     ppd_full_address=str(ppd_row.get("full_address", "")),
                     confidence_score=confidence_score,
                     address_similarity=address_similarity,
@@ -279,127 +332,39 @@ class FraudDetector:
                     is_confirmed_fraud=False,
                     detected_at=datetime.utcnow(),
                 )
-
                 db.add(fraud_match)
                 matches.append(fraud_match)
 
-        # Commit matches for this property
         if matches:
             await db.commit()
-            # Refresh to get IDs and relationships
-            for match in matches:
-                await db.refresh(match)
-                # Manually set the relationship to avoid lazy load later
-                match.property_listing = property
-
+            for m in matches:
+                await db.refresh(m)
+                m.property_listing = property
+                
         return matches
 
     def _calculate_risk_level(self, days_diff: int, confidence_score: float) -> str:
-        """
-        Calculate risk level based on date difference and confidence.
+        if days_diff <= 180: return "CRITICAL"
+        elif days_diff <= 365: return "HIGH"
+        elif days_diff <= 1095: return "MEDIUM"
+        else: return "LOW"
 
-        Levels:
-        - CRITICAL: 1-6 months (approx 180 days)
-        - HIGH: 6 months - 1 year (approx 365 days)
-        - MEDIUM: 1-3 years (approx 1095 days)
-        - LOW: 3-6 years (approx 2190 days)
-        """
-        # Adjust based on confidence if needed, for now strictly date based as requested
-        # but ensuring high confidence for Critical/High
-
-        if days_diff <= 180:
-            return "CRITICAL"
-        elif days_diff <= 365:
-            return "HIGH"
-        elif days_diff <= 1095:
-            return "MEDIUM"
-        else:
-            return "LOW"
-
-    def _calculate_confidence_score(
-        self, property: PropertyListing, ppd_row: pd.Series, address_similarity: float
-    ) -> float:
-        """
-        Calculate confidence score based on multiple factors.
-
-        Base weights (see FraudDetectionConfig): address, date proximity, postcode.
-        Optional small bonuses: county alignment vs PPD, listing price vs PPD price (capped).
-
-        Args:
-            property: PropertyListing object
-            ppd_row: PPD DataFrame row
-            address_similarity: Pre-calculated address similarity (0-100)
-
-        Returns:
-            Confidence score (0-100)
-        """
-        # Address similarity component (70% weight)
+    def _calculate_confidence_score(self, property: PropertyListing, ppd_row: pd.Series, address_similarity: float) -> float:
         address_component = address_similarity * config.ADDRESS_SIMILARITY_WEIGHT
-
-        # Date proximity component (20% weight)
         date_component = 0.0
         wd = _as_date(property.withdrawn_date)
         if wd and pd.notna(ppd_row.get("transfer_date")):
             ppd_date = pd.to_datetime(ppd_row["transfer_date"]).date()
             days_diff = abs((ppd_date - wd).days)
-
-            # Score decreases as days increase (max 365 days in scan window)
             max_days = config.SCAN_WINDOW_MONTHS * 30
             date_score = max(0, 100 - (days_diff / max_days * 100))
             date_component = date_score * config.DATE_PROXIMITY_WEIGHT
 
-        # Postcode exact match component (10% weight)
         postcode_component = 0.0
         prop_pc = (property.postcode or "").replace(" ", "").upper()
-        if not prop_pc and property.address:
-            m = re.search(
-                r"\b([A-Z]{1,2}\d[A-Z0-9]?\s*\d[A-Z]{2})\b",
-                property.address,
-                re.IGNORECASE,
-            )
-            if m:
-                prop_pc = re.sub(r"\s+", "", m.group(1).upper())
         if prop_pc and ppd_row.get("postcode"):
             ppd_postcode = str(ppd_row["postcode"]).replace(" ", "").upper()
-
             if prop_pc == ppd_postcode:
                 postcode_component = 100 * config.POSTCODE_MATCH_WEIGHT
 
-        # County alignment bonus (listing.county vs PPD county column)
-        county_bonus = 0.0
-        listing_county = getattr(property, "county", None)
-        ppd_county = ppd_row.get("county")
-        if listing_county and pd.notna(ppd_county) and str(ppd_county).strip():
-            lc = _norm_token(listing_county)
-            pc = _norm_token(str(ppd_county))
-            if lc and pc and (lc in pc or pc in lc or lc == pc):
-                county_bonus = _COUNTY_BONUS_CAP
-
-        # Listing price vs PPD transaction price proximity (optional)
-        price_bonus = 0.0
-        listing_price = _parse_listing_price_gbp(getattr(property, "price", None))
-        ppd_price = ppd_row.get("price")
-        if (
-            listing_price
-            and pd.notna(ppd_price)
-            and int(ppd_price) > 0
-        ):
-            ratio = min(listing_price, int(ppd_price)) / max(
-                listing_price, int(ppd_price)
-            )
-            if ratio >= 0.85:
-                price_bonus = _PRICE_BONUS_CAP
-            elif ratio >= 0.70:
-                price_bonus = _PRICE_BONUS_CAP * 0.6
-
-        # Calculate total confidence score
-        confidence_score = (
-            address_component
-            + date_component
-            + postcode_component
-            + county_bonus
-            + price_bonus
-        )
-        confidence_score = min(100.0, confidence_score)
-
-        return round(confidence_score, 2)
+        return round(min(100.0, address_component + date_component + postcode_component), 2)

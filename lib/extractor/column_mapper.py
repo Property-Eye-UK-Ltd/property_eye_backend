@@ -22,6 +22,7 @@ CANONICAL_FIELDS: List[str] = [
     "region",
     "county",
     "property_number",
+    "status",
     "withdrawn_date",
     "price",
     "commission",

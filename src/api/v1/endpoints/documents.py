@@ -212,7 +212,13 @@ async def upload_document(
                 continue
 
             # Parse withdrawn_date to proper date object
-            withdrawn_date = parse_date(row.get("withdrawn_date"))
+            withdrawn_date_raw = row.get("withdrawn_date")
+            withdrawn_date = parse_date(withdrawn_date_raw)
+
+            # HEURISTIC: If withdrawn_date is present, the status is "withdrawn"
+            status_val = _coerce_str(row.get("status"))
+            if not status_val and withdrawn_date:
+                status_val = "withdrawn"
 
             # Create new property listing
             property_listing = PropertyListing(
@@ -226,7 +232,7 @@ async def upload_document(
                 title_number=_coerce_str(row.get("title_number")),
                 client_name=_coerce_str(row.get("client_name")),
                 vendor_name=_coerce_str(row.get("vendor_name")),
-                status=(_coerce_str(row.get("status")) or "").lower(),
+                status=(status_val or "").lower(),
                 withdrawn_date=withdrawn_date,
                 price=_coerce_str(row.get("price")),
                 commission=_coerce_str(row.get("commission")),
@@ -317,6 +323,14 @@ async def ingest_listings_payload(
                 records_skipped += 1
                 continue
 
+            # Parse withdrawn_date
+            withdrawn_date = parse_date(row.get("withdrawn_date"))
+
+            # HEURISTIC: If withdrawn_date is present, the status is "withdrawn"
+            status_val = _coerce_str(row.get("status"))
+            if not status_val and withdrawn_date:
+                status_val = "withdrawn"
+
             listing = PropertyListing(
                 agency_id=agency_id,
                 address=address,
@@ -328,8 +342,8 @@ async def ingest_listings_payload(
                 title_number=_coerce_str(row.get("title_number")),
                 client_name=_coerce_str(row.get("client_name")),
                 vendor_name=_coerce_str(row.get("vendor_name")),
-                status=(_coerce_str(row.get("status")) or "").lower(),
-                withdrawn_date=parse_date(row.get("withdrawn_date")),
+                status=(status_val or "").lower(),
+                withdrawn_date=withdrawn_date,
                 price=_coerce_str(row.get("price")),
                 commission=_coerce_str(row.get("commission")),
                 contract_duration=_coerce_str(row.get("contract_duration")),
