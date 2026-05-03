@@ -49,7 +49,16 @@ class Settings(BaseSettings):
     CSV_VOLUME_PATH: str = "/data/csv"
     SYNC_PPD: bool = False
 
-    # Land Registry API Configuration
+    # Fraud Detection Tuning
+    FRAUD_LOOKBACK_MONTHS: int = 3      # months before withdrawal to search
+    FRAUD_LOOKAHEAD_MONTHS: int = 60    # months after withdrawal to search (default 5 yrs)
+    FRAUD_RISK_CRITICAL_DAYS: int = 180
+    FRAUD_RISK_HIGH_DAYS: int = 365
+    FRAUD_RISK_MEDIUM_DAYS: int = 1095
+    FRAUD_MIN_CONFIDENCE: float = 70.0
+    FRAUD_HIGH_CONFIDENCE: float = 85.0
+    FRAUD_MIN_ADDRESS_SIMILARITY: float = 80.0
+
     LAND_REGISTRY_API_KEY: Optional[str] = None
     LAND_REGISTRY_API_URL: str = "https://api.landregistry.gov.uk"
 

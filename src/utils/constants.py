@@ -18,21 +18,33 @@ class FraudDetectionConfig:
     PPD_COMPRESSION: str = field(default="snappy")
     CSV_VOLUME_PATH: str = field(default="./data/csv")
     SYNC_PPD: bool = field(default=False)
-    # PPD Filtering
-    SCAN_WINDOW_MONTHS: int = 24  # Check PPD records up to 24 months after withdrawal
+
+    # Scan window — configurable via FRAUD_LOOKBACK_MONTHS / FRAUD_LOOKAHEAD_MONTHS env vars
+    LOOKBACK_MONTHS: int = field(default=3)    # months BEFORE withdrawal to search PPD
+    LOOKAHEAD_MONTHS: int = field(default=60)  # months AFTER withdrawal to search PPD
+
+    # Legacy alias kept for any references in ppd_service (maps to LOOKAHEAD_MONTHS)
+    @property
+    def SCAN_WINDOW_MONTHS(self) -> int:  # noqa: N802
+        return self.LOOKAHEAD_MONTHS
+
+    # Risk level day thresholds
+    RISK_CRITICAL_DAYS: int = field(default=180)   # <= N days => CRITICAL
+    RISK_HIGH_DAYS: int = field(default=365)        # <= N days => HIGH
+    RISK_MEDIUM_DAYS: int = field(default=1095)     # <= N days => MEDIUM (else LOW)
 
     # Confidence Scoring
-    MIN_CONFIDENCE_THRESHOLD: float = 70.0  # Store matches above this score
-    HIGH_CONFIDENCE_THRESHOLD: float = 85.0  # Recommend for Land Registry verification
+    MIN_CONFIDENCE_THRESHOLD: float = field(default=70.0)   # Store matches above this
+    HIGH_CONFIDENCE_THRESHOLD: float = field(default=85.0)  # Flag for LR verification
 
     # Address Matching
-    MIN_ADDRESS_SIMILARITY: float = 80.0  # Minimum fuzzy match score
-    POSTCODE_MATCH_BONUS: float = 10.0  # Bonus points for exact postcode match
+    MIN_ADDRESS_SIMILARITY: float = field(default=80.0)
+    POSTCODE_MATCH_BONUS: float = field(default=10.0)
 
     # Confidence Score Weights
-    ADDRESS_SIMILARITY_WEIGHT: float = 0.70  # 70% weight for address matching
-    DATE_PROXIMITY_WEIGHT: float = 0.20  # 20% weight for date proximity
-    POSTCODE_MATCH_WEIGHT: float = 0.10  # 10% weight for postcode match
+    ADDRESS_SIMILARITY_WEIGHT: float = 0.70
+    DATE_PROXIMITY_WEIGHT: float = 0.20
+    POSTCODE_MATCH_WEIGHT: float = 0.10
 
     # Required Fields for legacy document parser (mapped DataFrame columns)
     # Buyer client_name is optional — many exports only carry vendor/seller names.
@@ -88,6 +100,18 @@ def get_config():
         PPD_COMPRESSION=settings.PPD_COMPRESSION,
         CSV_VOLUME_PATH=settings.CSV_VOLUME_PATH,
         SYNC_PPD=settings.SYNC_PPD,
+        # Scan window
+        LOOKBACK_MONTHS=settings.FRAUD_LOOKBACK_MONTHS,
+        LOOKAHEAD_MONTHS=settings.FRAUD_LOOKAHEAD_MONTHS,
+        # Risk thresholds
+        RISK_CRITICAL_DAYS=settings.FRAUD_RISK_CRITICAL_DAYS,
+        RISK_HIGH_DAYS=settings.FRAUD_RISK_HIGH_DAYS,
+        RISK_MEDIUM_DAYS=settings.FRAUD_RISK_MEDIUM_DAYS,
+        # Confidence
+        MIN_CONFIDENCE_THRESHOLD=settings.FRAUD_MIN_CONFIDENCE,
+        HIGH_CONFIDENCE_THRESHOLD=settings.FRAUD_HIGH_CONFIDENCE,
+        MIN_ADDRESS_SIMILARITY=settings.FRAUD_MIN_ADDRESS_SIMILARITY,
+        # Land Registry
         LAND_REGISTRY_API_URL=settings.LAND_REGISTRY_API_URL,
         LAND_REGISTRY_API_KEY=settings.LAND_REGISTRY_API_KEY or "",
         HMLR_BG_BASE_URL=settings.HMLR_BG_BASE_URL,

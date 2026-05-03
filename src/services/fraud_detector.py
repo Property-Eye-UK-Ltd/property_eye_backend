@@ -238,8 +238,8 @@ class FraudDetector:
         # 2. Date Filter (3 months before to 5 years after)
         wd = _as_date(property.withdrawn_date)
         if wd:
-            start_date = pd.Timestamp(wd - timedelta(days=3 * 30))
-            end_date = pd.Timestamp(wd + timedelta(days=60 * 30))
+            start_date = pd.Timestamp(wd - timedelta(days=config.LOOKBACK_MONTHS * 30))
+            end_date = pd.Timestamp(wd + timedelta(days=config.LOOKAHEAD_MONTHS * 30))
             if 'transfer_date_dt' in candidates.columns:
                 candidates = candidates[
                     (candidates['transfer_date_dt'] >= start_date) & 
@@ -344,9 +344,9 @@ class FraudDetector:
         return matches
 
     def _calculate_risk_level(self, days_diff: int, confidence_score: float) -> str:
-        if days_diff <= 180: return "CRITICAL"
-        elif days_diff <= 365: return "HIGH"
-        elif days_diff <= 1095: return "MEDIUM"
+        if days_diff <= config.RISK_CRITICAL_DAYS: return "CRITICAL"
+        elif days_diff <= config.RISK_HIGH_DAYS: return "HIGH"
+        elif days_diff <= config.RISK_MEDIUM_DAYS: return "MEDIUM"
         else: return "LOW"
 
     def _calculate_confidence_score(self, property: PropertyListing, ppd_row: pd.Series, address_similarity: float) -> float:

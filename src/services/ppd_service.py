@@ -243,13 +243,13 @@ class PPDService:
         for prop in properties:
             wd = _withdrawn_as_date(prop.withdrawn_date)
             if wd:
-                # Look back 3 months (few months before)
-                start_date = wd - timedelta(days=3 * 30)
+                # Look back N months before withdrawal
+                start_date = wd - timedelta(days=config.LOOKBACK_MONTHS * 30)
                 if min_date is None or start_date < min_date:
                     min_date = start_date
 
-                # Look forward 5 years (lots of years after)
-                end_date = wd + timedelta(days=60 * 30)
+                # Look forward N months after withdrawal
+                end_date = wd + timedelta(days=config.LOOKAHEAD_MONTHS * 30)
                 if max_date is None or end_date > max_date:
                     max_date = end_date
             else:
