@@ -61,6 +61,26 @@ def _norm_token(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 
+def _house_num(text: str) -> str:
+    """Extract the leading door/house number from an address or PAON/SAON field.
+
+    Strips commas and periods first (CSV artefacts like "53,") then matches
+    only the leading numeric token.  Returns '' when nothing found so that
+    callers can safely skip the check rather than false-rejecting.
+
+    Examples:
+        "53 Lammasmead, Wormley"  -> "53"
+        "33B, LAMMASMEAD"         -> "33B"
+        "53,"                     -> "53"
+        "Plot 42, Silver Birch"   -> ""   (starts with a word, not a number)
+        "Oliva, Middle Street"    -> ""   (named property)
+        ""                        -> ""
+    """
+    cleaned = re.sub(r"[,.]+", "", text.strip())
+    m = re.match(r"^(\d+[A-Za-z]?)\b", cleaned)
+    return m.group(1).upper() if m else ""
+
+
 class FraudDetector:
     """
     Service for detecting suspicious fraud matches (Stage 1).
@@ -264,7 +284,17 @@ class FraudDetector:
             base_addr, property.postcode
         )
 
+        # Pre-compute the listing's house number once, from the address only.
+        # (property_number is an agency internal ref and is NOT reliable for this.)
+        listing_num = _house_num(property.address or "")
+
         for _, ppd_row in candidates.iterrows():
+            # --- HARD FILTER: house number must match when both sides have one ---
+            # The number on the door never changes when a property is sold.
+            ppd_num = _house_num(str(ppd_row.get("paon", "")))
+            if listing_num and ppd_num and listing_num != ppd_num:
+                continue  # different property on the same street
+
             ppd_norm = str(ppd_row.get("normalized_address", ""))
             address_similarity = self.address_normalizer.calculate_similarity(prop_normalized, ppd_norm)
 
