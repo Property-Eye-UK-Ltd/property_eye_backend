@@ -6,6 +6,7 @@ Compiles withdrawn properties against PPD data to identify potential fraud cases
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
@@ -29,6 +30,20 @@ logger = logging.getLogger(__name__)
 _COUNTY_BONUS_CAP = 5.0
 _PRICE_BONUS_CAP = 5.0
 _TITLE_NUMBER_MATCH_SCORE = 100.0
+_UNIT_MARKERS = ("FLAT", "APT", "APARTMENT", "UNIT")
+_UNIT_RE = re.compile(
+    r"^\s*(?:FLAT|APT|APARTMENT|UNIT)\s+([A-Z0-9-]+)\b(?:\s*,?\s*(\d+[A-Z]?))?",
+    re.IGNORECASE,
+)
+_PLOT_RE = re.compile(r"^\s*PLOT\s+([A-Z0-9-]+)\b", re.IGNORECASE)
+_NUMBER_RE = re.compile(r"^\s*(?:NO\.?\s*)?(\d+[A-Za-z]?)\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class AddressIdentity:
+    kind: str
+    primary_id: str = ""
+    building_id: str = ""
 
 
 def _as_date(val) -> Optional[date]:
@@ -79,6 +94,129 @@ def _house_num(text: str) -> str:
     cleaned = re.sub(r"[,.]+", "", text.strip())
     m = re.match(r"^(\d+[A-Za-z]?)\b", cleaned)
     return m.group(1).upper() if m else ""
+
+
+def _clean_token(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).upper()
+
+
+def _parse_unit_identity(text: str) -> Optional[AddressIdentity]:
+    match = _UNIT_RE.match(text)
+    if not match:
+        return None
+    unit_id = _clean_token(match.group(1))
+    building_id = _clean_token(match.group(2))
+    return AddressIdentity(kind="flat", primary_id=unit_id, building_id=building_id)
+
+
+def _parse_plot_identity(text: str) -> Optional[AddressIdentity]:
+    match = _PLOT_RE.match(text)
+    if not match:
+        return None
+    return AddressIdentity(kind="plot", primary_id=_clean_token(match.group(1)))
+
+
+def _parse_street_number_identity(text: str) -> Optional[AddressIdentity]:
+    match = _NUMBER_RE.match(text)
+    if not match:
+        return None
+    return AddressIdentity(kind="street_number", primary_id=_clean_token(match.group(1)))
+
+
+def _listing_identity(address: Optional[str]) -> AddressIdentity:
+    text = _clean_token(address)
+    if not text:
+        return AddressIdentity(kind="unknown")
+
+    for parser in (_parse_unit_identity, _parse_plot_identity, _parse_street_number_identity):
+        identity = parser(text)
+        if identity:
+            return identity
+
+    return AddressIdentity(kind="named_building")
+
+
+def _ppd_identity(ppd_row: pd.Series) -> AddressIdentity:
+    saon = _clean_token(ppd_row.get("saon"))
+    paon = _clean_token(ppd_row.get("paon"))
+    full_address = _clean_token(ppd_row.get("full_address"))
+
+    unit_identity = _parse_unit_identity(saon) or _parse_unit_identity(full_address)
+    if unit_identity:
+        building_id = unit_identity.building_id or _clean_token(_house_num(paon))
+        return AddressIdentity(
+            kind="flat",
+            primary_id=unit_identity.primary_id,
+            building_id=building_id,
+        )
+
+    plot_identity = _parse_plot_identity(paon) or _parse_plot_identity(full_address)
+    if plot_identity:
+        return plot_identity
+
+    street_identity = _parse_street_number_identity(paon) or _parse_street_number_identity(
+        full_address
+    )
+    if street_identity:
+        return street_identity
+
+    return AddressIdentity(kind="named_building" if paon or full_address else "unknown")
+
+
+def _identities_are_compatible(
+    listing_identity: AddressIdentity, ppd_identity: AddressIdentity
+) -> bool:
+    if listing_identity.kind == "plot":
+        return (
+            ppd_identity.kind == "plot"
+            and listing_identity.primary_id
+            and listing_identity.primary_id == ppd_identity.primary_id
+        )
+
+    if listing_identity.kind == "flat":
+        if ppd_identity.kind != "flat":
+            return False
+        if (
+            listing_identity.primary_id
+            and ppd_identity.primary_id
+            and listing_identity.primary_id != ppd_identity.primary_id
+        ):
+            return False
+        if (
+            listing_identity.building_id
+            and ppd_identity.building_id
+            and listing_identity.building_id != ppd_identity.building_id
+        ):
+            return False
+        return bool(listing_identity.primary_id or ppd_identity.primary_id)
+
+    if listing_identity.kind == "street_number":
+        return (
+            ppd_identity.kind == "street_number"
+            and listing_identity.primary_id
+            and listing_identity.primary_id == ppd_identity.primary_id
+        )
+
+    if listing_identity.kind == "named_building" and ppd_identity.kind in {
+        "flat",
+        "plot",
+    }:
+        return False
+
+    return True
+
+
+def _identity_match_bonus(
+    listing_identity: AddressIdentity, ppd_identity: AddressIdentity
+) -> float:
+    if listing_identity.kind != ppd_identity.kind:
+        return 0.0
+    if (
+        listing_identity.primary_id
+        and listing_identity.primary_id == ppd_identity.primary_id
+    ):
+        return 15.0
+    return 0.0
 
 
 class FraudDetector:
@@ -271,42 +409,42 @@ class FraudDetector:
 
         # 3. Fuzzy Matching — candidates are now guaranteed to be the same postcode
         matches = []
-        prop_num = str(property.property_number).strip().upper() if property.property_number else ""
-        if not prop_num and property.address:
-            m = re.match(r"^(\d+)", property.address.strip())
-            if m: prop_num = m.group(1)
+        listing_identity = _listing_identity(property.address or "")
 
         base_addr = property.address or ""
-        if prop_num and prop_num not in base_addr.upper():
+        if (
+            listing_identity.kind == "street_number"
+            and listing_identity.primary_id
+            and listing_identity.primary_id not in base_addr.upper()
+        ):
             base_addr = f"{property.property_number} {base_addr}".strip()
 
         prop_normalized = property.normalized_address or self.address_normalizer.normalize(
             base_addr, property.postcode
         )
 
-        # Pre-compute the listing's house number once, from the address only.
-        # (property_number is an agency internal ref and is NOT reliable for this.)
-        listing_num = _house_num(property.address or "")
-
         for _, ppd_row in candidates.iterrows():
-            # --- HARD FILTER: house number must match when both sides have one ---
-            # The number on the door never changes when a property is sold.
-            ppd_num = _house_num(str(ppd_row.get("paon", "")))
-            if listing_num and ppd_num and listing_num != ppd_num:
-                continue  # different property on the same street
+            ppd_identity = _ppd_identity(ppd_row)
+            if not _identities_are_compatible(listing_identity, ppd_identity):
+                logger.debug(
+                    "[Fuzzy Matching] Rejected identity mismatch listing=%s ppd=%s address=%s ppd_address=%s",
+                    listing_identity,
+                    ppd_identity,
+                    property.address[:60],
+                    str(ppd_row.get("full_address", ""))[:60],
+                )
+                continue
 
             ppd_norm = str(ppd_row.get("normalized_address", ""))
             address_similarity = self.address_normalizer.calculate_similarity(prop_normalized, ppd_norm)
 
-            paon_match = False
-            ppd_paon = str(ppd_row.get("paon", "")).strip().upper()
-            if prop_num and prop_num == ppd_paon:
-                paon_match = True
-                address_similarity = min(100.0, address_similarity + 15.0)
+            identity_boost = _identity_match_bonus(listing_identity, ppd_identity)
+            if identity_boost:
+                address_similarity = min(100.0, address_similarity + identity_boost)
 
             ppd_pc = str(ppd_row.get("postcode", "")).strip().upper()
 
-            if address_similarity < config.MIN_ADDRESS_SIMILARITY and not paon_match:
+            if address_similarity < config.MIN_ADDRESS_SIMILARITY and not identity_boost:
                 continue
 
             confidence_score = self._calculate_confidence_score(property, ppd_row, address_similarity)
