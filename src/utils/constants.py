@@ -70,12 +70,16 @@ class FraudDetectionConfig:
 
     # HMLR Business Gateway (Online Owner Verification)
     HMLR_BG_BASE_URL: str = field(default="https://bgtest.landregistry.gov.uk")
+    APP_ENV: str = field(default="dev")
 
     HMLR_BG_USERNAME: str = field(default="")
     HMLR_BG_PASSWORD: str = field(default="")
     HMLR_TLS_CERT_PATH: str = field(default="")
     HMLR_TLS_KEY_PATH: str = field(default="")
     HMLR_CA_BUNDLE_PATH: str = field(default="")
+    HMLR_TLS_CERT_PEM: str = field(default="")
+    HMLR_TLS_KEY_PEM: str = field(default="")
+    HMLR_CA_BUNDLE_PEM: str = field(default="")
     HMLR_TIMEOUT_SECONDS: int = 20
 
     # Parquet File Sizing
@@ -115,11 +119,15 @@ def get_config():
         LAND_REGISTRY_API_URL=settings.LAND_REGISTRY_API_URL,
         LAND_REGISTRY_API_KEY=settings.LAND_REGISTRY_API_KEY or "",
         HMLR_BG_BASE_URL=settings.HMLR_BG_BASE_URL,
+        APP_ENV=settings.APP_ENV,
         HMLR_BG_USERNAME=settings.HMLR_BG_USERNAME,
         HMLR_BG_PASSWORD=settings.HMLR_BG_PASSWORD,
         HMLR_TLS_CERT_PATH=settings.HMLR_TLS_CERT_PATH,
         HMLR_TLS_KEY_PATH=settings.HMLR_TLS_KEY_PATH,
         HMLR_CA_BUNDLE_PATH=settings.HMLR_CA_BUNDLE_PATH or "",
+        HMLR_TLS_CERT_PEM=settings.HMLR_TLS_CERT_PEM or "",
+        HMLR_TLS_KEY_PEM=settings.HMLR_TLS_KEY_PEM or "",
+        HMLR_CA_BUNDLE_PEM=settings.HMLR_CA_BUNDLE_PEM or "",
         HMLR_TIMEOUT_SECONDS=settings.HMLR_TIMEOUT_SECONDS,
     )
 

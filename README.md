@@ -69,6 +69,9 @@ PPD_COMPRESSION=snappy
 LAND_REGISTRY_API_KEY=your_api_key_here
 LAND_REGISTRY_API_URL=https://api.landregistry.gov.uk
 
+# Deployment Environment
+APP_ENV=dev
+
 # Redis Configuration (for future caching)
 REDIS_URL=redis://localhost:6379/0
 ```
@@ -79,6 +82,9 @@ REDIS_URL=redis://localhost:6379/0
 - **PPD_COMPRESSION**: Compression algorithm - `snappy` (faster) or `zstd` (better compression)
 - **LAND_REGISTRY_API_KEY**: API key for UK Land Registry ownership verification
 - **DATABASE_URL**: Database connection string
+- **APP_ENV**: Set to `production` on Railway or `dev` locally
+- **HMLR_TLS_CERT_PATH / HMLR_TLS_KEY_PATH / HMLR_CA_BUNDLE_PATH**: File paths for the mTLS assets
+- **HMLR_TLS_CERT_PEM / HMLR_TLS_KEY_PEM / HMLR_CA_BUNDLE_PEM**: Optional PEM contents for Railway env vars; the app writes them to the configured paths when files are missing
 
 ## Database Setup
 

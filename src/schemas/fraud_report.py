@@ -90,6 +90,34 @@ class FraudMatchSchema(BaseModel):
     verified_at: Optional[datetime] = Field(None, description="When match was verified")
 
 
+class FraudReportGroupSchema(BaseModel):
+    """Schema for grouped fraud matches representing likely same-property resales."""
+
+    group_key: str = Field(..., description="Stable grouping key for the property")
+    property_address: str = Field(..., description="Display address for the property")
+    postcode: Optional[str] = Field(None, description="Normalized postcode for the group")
+    property_number: Optional[str] = Field(
+        None, description="Extracted house, flat, or plot number"
+    )
+    total_matches: int = Field(..., description="Number of matched resale records")
+    highest_confidence_score: float = Field(
+        ..., description="Highest confidence score within the group"
+    )
+    risk_level: Optional[str] = Field(
+        None, description="Highest-priority risk level within the group"
+    )
+    latest_transfer_date: Optional[datetime] = Field(
+        None, description="Most recent transfer date in the group"
+    )
+    suspicious_count: int = Field(..., description="Count of suspicious items")
+    confirmed_fraud_count: int = Field(..., description="Count of confirmed fraud items")
+    cleared_count: int = Field(..., description="Count of cleared items")
+    error_count: int = Field(..., description="Count of errored items")
+    items: list[FraudMatchSchema] = Field(
+        ..., description="Nested fraud matches for this likely property"
+    )
+
+
 class ConfidenceDistribution(BaseModel):
     """
     Distribution of matches by confidence score ranges.

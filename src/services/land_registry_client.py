@@ -25,6 +25,7 @@ from src.schemas.land_registry_oov import (
     OovMatchedTitle,
     OovOwner,
 )
+from src.utils.hmlr_files import resolve_hmlr_file
 from src.utils.constants import config
 
 logger = logging.getLogger(__name__)
@@ -66,9 +67,27 @@ class LandRegistryClient:
         self._username = config.HMLR_BG_USERNAME
         self._password = config.HMLR_BG_PASSWORD
         self._timeout = config.HMLR_TIMEOUT_SECONDS
-        self._cert_path = config.HMLR_TLS_CERT_PATH
-        self._key_path = config.HMLR_TLS_KEY_PATH
-        self._ca_bundle_path = config.HMLR_CA_BUNDLE_PATH or None
+        self._cert_path = resolve_hmlr_file(
+            config.HMLR_TLS_CERT_PATH,
+            content=config.HMLR_TLS_CERT_PEM or None,
+            app_env=config.APP_ENV,
+            label="HMLR TLS client certificate",
+            content_env_name="HMLR_TLS_CERT_PEM",
+        )
+        self._key_path = resolve_hmlr_file(
+            config.HMLR_TLS_KEY_PATH,
+            content=config.HMLR_TLS_KEY_PEM or None,
+            app_env=config.APP_ENV,
+            label="HMLR TLS private key",
+            content_env_name="HMLR_TLS_KEY_PEM",
+        )
+        self._ca_bundle_path = resolve_hmlr_file(
+            config.HMLR_CA_BUNDLE_PATH or "",
+            content=config.HMLR_CA_BUNDLE_PEM or None,
+            app_env=config.APP_ENV,
+            label="HMLR CA bundle",
+            content_env_name="HMLR_CA_BUNDLE_PEM",
+        )
 
         # OOV endpoint differs between test and production:
         #   test:       /b2b/EOOV_StubService/OnlineOwnershipVerificationV1_0WebService
@@ -79,15 +98,12 @@ class LandRegistryClient:
         self._oov_path = f"/b2b/{stub_or_engine}/OnlineOwnershipVerificationV1_0WebService"
 
         # Build an explicit SSL context for mutual TLS and CA verification.
-        # HMLR_CA_BUNDLE_PATH must be set — system CAs do not include the HMLR
-        # root CA, so omitting it will always produce CERTIFICATE_VERIFY_FAILED.
-        if not self._ca_bundle_path:
-            raise RuntimeError("HMLR_CA_BUNDLE_PATH is not configured. ")
-
-        ssl_context = ssl.create_default_context(cafile=self._ca_bundle_path)
+        # The CA bundle is resolved above so we can either reuse an existing
+        # file or materialize one from env contents before the request runs.
+        ssl_context = ssl.create_default_context(cafile=str(self._ca_bundle_path))
         ssl_context.load_cert_chain(
-            certfile=self._cert_path,
-            keyfile=self._key_path,
+            certfile=str(self._cert_path),
+            keyfile=str(self._key_path),
         )
 
         self.client = httpx.AsyncClient(

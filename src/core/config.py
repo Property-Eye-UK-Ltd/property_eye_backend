@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "Property Eye Fraud Detection POC"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
+    APP_ENV: str = "dev"
 
     # Database Configuration
     # PostgreSQL for production, SQLite for POC (PPD scanning and output only)
@@ -41,6 +42,11 @@ class Settings(BaseSettings):
         if v and v.startswith("postgresql://"):
             return v.replace("postgresql://", "postgresql+asyncpg://", 1)
         return v
+
+    @field_validator("APP_ENV")
+    @classmethod
+    def normalize_app_env(cls, v: str) -> str:
+        return v.strip().lower()
 
     # PPD Storage Configuration
     # For Railway: use /data (mounted volume), for local: use ./data/ppd
@@ -73,6 +79,9 @@ class Settings(BaseSettings):
     HMLR_TLS_KEY_PATH: str
     # Optional custom CA bundle for BG test / production (PEM file)
     HMLR_CA_BUNDLE_PATH: Optional[str] = None
+    HMLR_TLS_CERT_PEM: Optional[str] = None
+    HMLR_TLS_KEY_PEM: Optional[str] = None
+    HMLR_CA_BUNDLE_PEM: Optional[str] = None
     HMLR_TIMEOUT_SECONDS: int = 20
 
     # Redis Configuration (for future caching)
