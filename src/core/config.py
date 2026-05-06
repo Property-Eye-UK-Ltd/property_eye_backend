@@ -6,6 +6,7 @@ configuration for database connections, API keys, and application settings.
 """
 
 from typing import Optional
+
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -56,8 +57,10 @@ class Settings(BaseSettings):
     SYNC_PPD: bool = False
 
     # Fraud Detection Tuning
-    FRAUD_LOOKBACK_MONTHS: int = 3      # months before withdrawal to search
-    FRAUD_LOOKAHEAD_MONTHS: int = 60    # months after withdrawal to search (default 5 yrs)
+    FRAUD_LOOKBACK_MONTHS: int = 3  # months before withdrawal to search
+    FRAUD_LOOKAHEAD_MONTHS: int = (
+        60  # months after withdrawal to search (default 5 yrs)
+    )
     FRAUD_RISK_CRITICAL_DAYS: int = 180
     FRAUD_RISK_HIGH_DAYS: int = 365
     FRAUD_RISK_MEDIUM_DAYS: int = 1095
@@ -89,7 +92,11 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # CORS Configuration
-    CORS_ORIGINS: list = ["*"]  # Configure appropriately for production
+    CORS_ORIGINS: list = [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://propertyeye-pilot.vercel.app",
+    ]
 
     # API Configuration
     API_V1_PREFIX: str = "/api/v1"

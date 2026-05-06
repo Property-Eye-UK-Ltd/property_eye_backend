@@ -6,6 +6,7 @@ Scans CSV volume for new PPD files and ingests them automatically.
 
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,44 @@ class PPDSyncService:
     def __init__(self):
         self.csv_volume_path = Path(config.CSV_VOLUME_PATH)
         self.ppd_service = PPDService()
+
+    async def _upsert_ingest_history(
+        self,
+        session: AsyncSession,
+        *,
+        csv_filename: str,
+        csv_path: str,
+        parquet_path: str,
+        year: int,
+        month: int,
+        records_processed: int,
+    ) -> None:
+        """Insert or update a PPD ingest history row for a CSV filename."""
+        stmt = select(PPDIngestHistory).where(
+            PPDIngestHistory.csv_filename == csv_filename
+        )
+        result = await session.execute(stmt)
+        history = result.scalar_one_or_none()
+
+        if history:
+            history.csv_path = csv_path
+            history.parquet_path = parquet_path
+            history.year = year
+            history.month = month
+            history.records_processed = records_processed
+            history.ingested_at = datetime.utcnow()
+            return
+
+        session.add(
+            PPDIngestHistory(
+                csv_filename=csv_filename,
+                csv_path=csv_path,
+                parquet_path=parquet_path,
+                year=year,
+                month=month,
+                records_processed=records_processed,
+            )
+        )
 
     async def sync_ppd_data(self) -> dict:
         """
@@ -108,8 +147,8 @@ class PPDSyncService:
                             parquet_path = self.ppd_service._get_parquet_path(
                                 year
                             )
-
-                            history_record = PPDIngestHistory(
+                            await self._upsert_ingest_history(
+                                session,
                                 csv_filename=filename,
                                 csv_path=str(csv_file),
                                 parquet_path=str(parquet_path),
@@ -117,8 +156,6 @@ class PPDSyncService:
                                 month=month,
                                 records_processed=ingest_summary.successful,
                             )
-
-                            session.add(history_record)
                             await session.commit()
 
                             logger.info(

@@ -43,6 +43,44 @@ class PPDUploadService:
             "processed_at": job.processed_at,
         }
 
+    async def _upsert_ingest_history(
+        self,
+        session: AsyncSession,
+        *,
+        csv_filename: str,
+        csv_path: str,
+        parquet_path: str,
+        year: int,
+        month: int,
+        records_processed: int,
+    ) -> None:
+        """Insert or update a PPD ingest history row for the source CSV."""
+        stmt = select(PPDIngestHistory).where(
+            PPDIngestHistory.csv_filename == csv_filename
+        )
+        result = await session.execute(stmt)
+        history = result.scalar_one_or_none()
+
+        if history:
+            history.csv_path = csv_path
+            history.parquet_path = parquet_path
+            history.year = year
+            history.month = month
+            history.records_processed = records_processed
+            history.ingested_at = datetime.utcnow()
+            return
+
+        session.add(
+            PPDIngestHistory(
+                csv_filename=csv_filename,
+                csv_path=csv_path,
+                parquet_path=parquet_path,
+                year=year,
+                month=month,
+                records_processed=records_processed,
+            )
+        )
+
     async def restore_upload_file(
         self,
         upload_id: str,
@@ -124,8 +162,8 @@ class PPDUploadService:
                     # Record in history
                     # Updated to use year-only partitioning
                     parquet_path = self.ppd_service._get_parquet_path(year)
-
-                    history_record = PPDIngestHistory(
+                    await self._upsert_ingest_history(
+                        session,
                         csv_filename=filename,
                         csv_path=csv_path,
                         parquet_path=str(parquet_path),
@@ -133,8 +171,6 @@ class PPDUploadService:
                         month=month,
                         records_processed=ingest_summary.successful,
                     )
-
-                    session.add(history_record)
 
                     # Update job status
                     job.status = "completed"
@@ -159,6 +195,7 @@ class PPDUploadService:
 
             except Exception as e:
                 logger.error(f"Error processing upload {upload_id}: {str(e)}")
+                await session.rollback()
 
                 # Update job status to failed
                 try:
