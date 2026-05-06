@@ -2,9 +2,11 @@
 PPD Upload Service for handling background processing of uploaded CSV files.
 """
 
+import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import BinaryIO
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +24,64 @@ class PPDUploadService:
 
     def __init__(self):
         self.ppd_service = PPDService()
+
+    def _build_status_payload(self, job: PPDUploadJob) -> dict:
+        """Build a status payload including filesystem presence flags."""
+        csv_path = Path(job.csv_path)
+        parquet_path = self.ppd_service._get_parquet_path(job.year)
+        return {
+            "upload_id": job.id,
+            "filename": job.filename,
+            "year": job.year,
+            "month": job.month,
+            "status": job.status,
+            "records_processed": job.records_processed,
+            "error_message": job.error_message,
+            "source_file_exists": csv_path.exists(),
+            "parquet_file_exists": parquet_path.exists(),
+            "uploaded_at": job.uploaded_at,
+            "processed_at": job.processed_at,
+        }
+
+    async def restore_upload_file(
+        self,
+        upload_id: str,
+        file_obj: BinaryIO,
+    ) -> bool:
+        """
+        Restore an upload's CSV file at its original path and queue reprocessing.
+
+        Returns:
+            True when the upload exists and the file was restored.
+        """
+        async with AsyncSessionLocal() as session:
+            try:
+                stmt = select(PPDUploadJob).where(PPDUploadJob.id == upload_id)
+                result = await session.execute(stmt)
+                job = result.scalar_one_or_none()
+                if not job:
+                    logger.warning(f"Upload job not found for reupload: {upload_id}")
+                    return False
+
+                csv_path = Path(job.csv_path)
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Replace the existing file on disk so the original job path is restored.
+                with open(csv_path, "wb") as target:
+                    while chunk := file_obj.read(10 * 1024 * 1024):
+                        target.write(chunk)
+
+                job.status = "uploaded"
+                job.error_message = None
+                job.records_processed = None
+                job.processed_at = None
+                await session.commit()
+
+                asyncio.create_task(self.process_upload(upload_id))
+                return True
+            except Exception as e:
+                logger.error(f"Error restoring upload {upload_id}: {str(e)}")
+                return False
 
     async def process_upload(self, upload_id: str) -> None:
         """
@@ -63,9 +123,7 @@ class PPDUploadService:
                 if ingest_summary.successful > 0:
                     # Record in history
                     # Updated to use year-only partitioning
-                    parquet_path = self.ppd_service._get_parquet_path(
-                        year
-                    )
+                    parquet_path = self.ppd_service._get_parquet_path(year)
 
                     history_record = PPDIngestHistory(
                         csv_filename=filename,

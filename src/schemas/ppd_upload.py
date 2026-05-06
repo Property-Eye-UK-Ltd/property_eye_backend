@@ -36,6 +36,12 @@ class PPDUploadStatusResponse(BaseModel):
         None, description="Number of records processed"
     )
     error_message: Optional[str] = Field(None, description="Error message if failed")
+    source_file_exists: bool = Field(
+        ..., description="Whether the uploaded CSV still exists on the filesystem"
+    )
+    parquet_file_exists: bool = Field(
+        ..., description="Whether the processed Parquet file exists on the filesystem"
+    )
     uploaded_at: datetime = Field(..., description="Upload timestamp")
     processed_at: Optional[datetime] = Field(
         None, description="Processing completion timestamp"

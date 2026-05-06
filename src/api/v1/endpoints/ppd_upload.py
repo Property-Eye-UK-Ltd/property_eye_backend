@@ -164,17 +164,7 @@ async def get_upload_status(
             detail=f"Upload job {upload_id} not found",
         )
 
-    return PPDUploadStatusResponse(
-        upload_id=job.id,
-        filename=job.filename,
-        year=job.year,
-        month=job.month,
-        status=job.status,
-        records_processed=job.records_processed,
-        error_message=job.error_message,
-        uploaded_at=job.uploaded_at,
-        processed_at=job.processed_at,
-    )
+    return PPDUploadService()._build_status_payload(job)
 
 
 @router.get(
@@ -194,20 +184,46 @@ async def list_uploads(
     result = await db.execute(stmt)
     jobs = result.scalars().all()
 
-    return [
-        PPDUploadStatusResponse(
-            upload_id=job.id,
-            filename=job.filename,
-            year=job.year,
-            month=job.month,
-            status=job.status,
-            records_processed=job.records_processed,
-            error_message=job.error_message,
-            uploaded_at=job.uploaded_at,
-            processed_at=job.processed_at,
+    service = PPDUploadService()
+    return [service._build_status_payload(job) for job in jobs]
+
+
+@router.post(
+    "/upload/{upload_id}/reupload",
+    response_model=PPDUploadStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Reupload a PPD CSV",
+    description="Restore a deleted PPD CSV at its original path and reprocess it.",
+)
+async def reupload_ppd_csv(
+    upload_id: str,
+    file: UploadFile = File(..., description="PPD CSV file"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Restore an existing PPD upload from a browser-uploaded CSV file."""
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only CSV files are supported",
         )
-        for job in jobs
-    ]
+
+    service = PPDUploadService()
+    restored = await service.restore_upload_file(upload_id, file.file)
+    if not restored:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload job {upload_id} not found or could not be restored",
+        )
+
+    stmt = select(PPDUploadJob).where(PPDUploadJob.id == upload_id)
+    result = await db.execute(stmt)
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload job {upload_id} not found",
+        )
+    return service._build_status_payload(job)
 
 
 @router.delete(
