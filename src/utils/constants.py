@@ -70,6 +70,7 @@ class FraudDetectionConfig:
 
     # HMLR Business Gateway (Online Owner Verification)
     HMLR_BG_BASE_URL: str = field(default="https://bgtest.landregistry.gov.uk")
+    HMLR_RES_PATH: str = field(default="")
     APP_ENV: str = field(default="dev")
 
     HMLR_BG_USERNAME: str = field(default="")
@@ -119,6 +120,7 @@ def get_config():
         LAND_REGISTRY_API_URL=settings.LAND_REGISTRY_API_URL,
         LAND_REGISTRY_API_KEY=settings.LAND_REGISTRY_API_KEY or "",
         HMLR_BG_BASE_URL=settings.HMLR_BG_BASE_URL,
+        HMLR_RES_PATH=settings.HMLR_RES_PATH,
         APP_ENV=settings.APP_ENV,
         HMLR_BG_USERNAME=settings.HMLR_BG_USERNAME,
         HMLR_BG_PASSWORD=settings.HMLR_BG_PASSWORD,

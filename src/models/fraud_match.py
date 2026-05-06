@@ -82,6 +82,12 @@ class FraudMatch(Base):
 
     # Relationships
     property_listing = relationship("PropertyListing", back_populates="fraud_matches")
+    register_extract = relationship(
+        "RegisterExtract",
+        back_populates="fraud_match",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return (

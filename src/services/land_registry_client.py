@@ -30,6 +30,182 @@ from src.utils.constants import config
 
 logger = logging.getLogger(__name__)
 
+POSTCODE_REGEX = re.compile(r"[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}", re.IGNORECASE)
+LEADING_NUMBER_REGEX = re.compile(r"^\s*(\d+[A-Z]?)\b[\s,]*(.*)$", re.IGNORECASE)
+SUB_BUILDING_REGEX = re.compile(
+    r"^\s*(?:flat|unit|apartment|apt|suite|room|floor)\s+([A-Z0-9\-\/]+)\b",
+    re.IGNORECASE,
+)
+HONORIFIC_REGEX = re.compile(
+    r"^(mr|mrs|ms|miss|dr|prof|sir|lady|lord)\.?\s+",
+    re.IGNORECASE,
+)
+STREET_KEYWORDS = {
+    "road",
+    "street",
+    "lane",
+    "grove",
+    "avenue",
+    "hill",
+    "close",
+    "drive",
+    "way",
+    "court",
+    "place",
+    "crescent",
+    "terrace",
+    "gardens",
+    "walk",
+    "rise",
+    "view",
+    "park",
+    "mews",
+}
+COUNTY_OR_REGION_PARTS = {
+    "bedfordshire",
+    "berkshire",
+    "buckinghamshire",
+    "cambridgeshire",
+    "cheshire",
+    "cornwall",
+    "cumbria",
+    "derbyshire",
+    "devon",
+    "dorset",
+    "durham",
+    "east sussex",
+    "essex",
+    "gloucestershire",
+    "greater london",
+    "greater manchester",
+    "hampshire",
+    "herefordshire",
+    "hertfordshire",
+    "kent",
+    "lancashire",
+    "leicestershire",
+    "lincolnshire",
+    "merseyside",
+    "norfolk",
+    "north yorkshire",
+    "northamptonshire",
+    "northumberland",
+    "nottinghamshire",
+    "oxfordshire",
+    "rutland",
+    "shropshire",
+    "somerset",
+    "south yorkshire",
+    "staffordshire",
+    "suffolk",
+    "surrey",
+    "tyne and wear",
+    "warwickshire",
+    "west midlands",
+    "west sussex",
+    "west yorkshire",
+    "wiltshire",
+    "worcestershire",
+    "yorkshire",
+}
+
+
+def normalise_postcode(postcode: str) -> str:
+    """Normalise a UK postcode to uppercase with a single inward-code space."""
+    compact = re.sub(r"\s+", "", (postcode or "").upper())
+    if len(compact) > 3:
+        return f"{compact[:-3]} {compact[-3:]}"
+    return compact
+
+
+def parse_seller_name(full_name: str) -> dict[str, str]:
+    """Split a seller name into HMLR OOV fields after stripping honorifics."""
+    cleaned = re.sub(r"\s+", " ", (full_name or "").strip())
+    while cleaned and HONORIFIC_REGEX.match(cleaned):
+        cleaned = HONORIFIC_REGEX.sub("", cleaned, count=1).strip()
+
+    if not cleaned:
+        return {"Forename": "", "Surname": ""}
+
+    if " " not in cleaned or cleaned == cleaned.upper():
+        return {"Forename": "", "Surname": cleaned}
+
+    tokens = cleaned.split()
+    parsed = {
+        "Forename": tokens[0],
+        "Surname": tokens[-1],
+    }
+    if len(tokens) > 2:
+        parsed["MiddleNames"] = " ".join(tokens[1:-1])
+    return parsed
+
+
+def parse_address_for_oov(address: str, postcode: str) -> dict[str, str]:
+    """Parse a listing address into the HMLR OOV property-address fields."""
+    raw_address = re.sub(r"\s+", " ", (address or "").strip().strip(","))
+    extracted_postcode_match = POSTCODE_REGEX.search(raw_address.upper())
+    extracted_postcode = (
+        normalise_postcode(extracted_postcode_match.group(0))
+        if extracted_postcode_match
+        else normalise_postcode(postcode)
+    )
+
+    address_without_postcode = raw_address
+    if extracted_postcode_match:
+        address_without_postcode = POSTCODE_REGEX.sub("", raw_address, count=1)
+    parts = [part.strip(" ,") for part in address_without_postcode.split(",") if part.strip(" ,")]
+
+    parsed: dict[str, str] = {}
+    remainder_parts = parts[:]
+
+    if remainder_parts:
+        first_part = remainder_parts[0]
+        sub_building_match = SUB_BUILDING_REGEX.match(first_part)
+        if sub_building_match:
+            parsed["SubBuildingName"] = sub_building_match.group(1).strip()
+            remainder_parts = remainder_parts[1:]
+            if remainder_parts and not LEADING_NUMBER_REGEX.match(remainder_parts[0]):
+                parsed["BuildingName"] = remainder_parts[0]
+                remainder_parts = remainder_parts[1:]
+        elif LEADING_NUMBER_REGEX.match(first_part):
+            number_match = LEADING_NUMBER_REGEX.match(first_part)
+            assert number_match is not None
+            parsed["BuildingNumber"] = number_match.group(1).strip()
+            first_remainder = number_match.group(2).strip(" ,")
+            remainder_parts = remainder_parts[1:]
+            if first_remainder:
+                remainder_parts.insert(0, first_remainder)
+        elif not re.search(r"\d", first_part):
+            parsed["BuildingName"] = first_part
+            remainder_parts = remainder_parts[1:]
+
+    if remainder_parts:
+        street_part = remainder_parts[0]
+        if LEADING_NUMBER_REGEX.match(street_part):
+            number_match = LEADING_NUMBER_REGEX.match(street_part)
+            assert number_match is not None
+            parsed.setdefault("BuildingNumber", number_match.group(1).strip())
+            street_candidate = number_match.group(2).strip(" ,")
+            if street_candidate:
+                parsed["StreetName"] = street_candidate
+            remainder_parts = remainder_parts[1:]
+        else:
+            parsed["StreetName"] = street_part
+            remainder_parts = remainder_parts[1:]
+
+    filtered_locality_parts = [
+        part
+        for part in remainder_parts
+        if part and part.strip().lower() not in COUNTY_OR_REGION_PARTS
+    ]
+    if filtered_locality_parts:
+        parsed["CityName"] = filtered_locality_parts[-1]
+
+    if extracted_postcode:
+        parsed["PostCodeZone"] = extracted_postcode
+
+    return {key: value for key, value in parsed.items() if value}
+
 
 class OwnershipVerificationResult:
     """Result of high-level ownership verification using OOV."""
@@ -111,6 +287,7 @@ class LandRegistryClient:
             verify=ssl_context,
             timeout=self._timeout,
         )
+        self._postcode_city_cache: dict[str, str] = {}
 
     async def verify_owner(self, request: OovRequest) -> OovResponse:
         """
@@ -144,8 +321,10 @@ class LandRegistryClient:
             if request.address:
                 addr = request.address
                 logger.info(
-                    "OOV address fields: building=%s street=%s town=%s postcode=%s",
-                    addr.building_name_or_number,
+                    "OOV address fields: sub_building=%s building_name=%s building_number=%s street=%s town=%s postcode=%s",
+                    addr.sub_building_name or "",
+                    addr.building_name or "",
+                    addr.building_number or "",
                     addr.street or "",
                     addr.town or "",
                     addr.postcode or "",
@@ -247,6 +426,7 @@ class LandRegistryClient:
             property_address=property_address,
             postcode=postcode,
             title_number=title_number if use_title else None,
+            building_name_or_number=building_name_or_number,
         )
         if precheck_error and not self._is_test_mode:
             logger.warning(
@@ -261,26 +441,21 @@ class LandRegistryClient:
                 raw_response=precheck_error,
             )
 
-        # Build a minimal OOV request from the flat address and expected owner name.
-        clean_addr = (property_address or "").strip().rstrip(",").strip()
+        address_fields = parse_address_for_oov(property_address, postcode)
+        address_fields = self._apply_building_hint(
+            address_fields, building_name_or_number
+        )
+        resolved_city = await self._resolve_city_name_from_postcode(
+            address_fields.get("PostCodeZone", ""),
+            address_fields.get("CityName"),
+        )
+        if resolved_city:
+            address_fields["CityName"] = resolved_city
 
-        # Extract building and street parts. Prefer explicit building name/number if provided.
-        if building_name_or_number and building_name_or_number.strip():
-            building_part = building_name_or_number.strip()
-            # If the building part is already at the start of the address string, 
-            # remove it to extract only the street part.
-            if clean_addr.upper().startswith(building_part.upper()):
-                # Remove building part + optional comma/space
-                street_part = re.sub(
-                    f"^{re.escape(building_part)}\\s*,?\\s*", 
-                    "", clean_addr, flags=re.IGNORECASE
-                ).strip()
-            else:
-                street_part = clean_addr
-        else:
-            building_part, street_part = self._split_address(clean_addr)
-            
-        person_forename, person_surname = self._split_name(expected_owner_name)
+        name_fields = parse_seller_name(expected_owner_name)
+        person_forename = name_fields.get("Forename", "")
+        person_surname = name_fields.get("Surname", "")
+        person_middle_names = name_fields.get("MiddleNames")
 
         if not (person_forename and person_surname) and not self._is_test_mode:
             return OwnershipVerificationResult(
@@ -296,14 +471,13 @@ class LandRegistryClient:
                 },
             )
 
-        # Ensure town is within schema length limits
-        final_town = town.strip()[:35] if town and town.strip() else None
-
         address = OovAddress(
-            building_name_or_number=building_part,
-            street=street_part,
-            town=final_town,
-            postcode=self._normalise_uk_postcode(postcode) or None,
+            sub_building_name=address_fields.get("SubBuildingName"),
+            building_name=address_fields.get("BuildingName"),
+            building_number=address_fields.get("BuildingNumber"),
+            street=address_fields.get("StreetName"),
+            town=(address_fields.get("CityName") or town or None),
+            postcode=address_fields.get("PostCodeZone"),
         )
 
         if message_id:
@@ -329,6 +503,7 @@ class LandRegistryClient:
                 else {
                     "title": None,
                     "forename": person_forename,
+                    "middle_names": person_middle_names,
                     "surname": person_surname,
                 }
             ),
@@ -338,6 +513,33 @@ class LandRegistryClient:
             historical_match=True,
             partial_match=True,
             highlight_additional_owners=True,
+        )
+
+        report_id = message_id or ref
+        logger.info(
+            "OOV request | report_id=%s | address_fields=%s | name_fields=%s",
+            report_id,
+            {
+                key: value
+                for key, value in {
+                    "SubBuildingName": address.sub_building_name,
+                    "BuildingName": address.building_name,
+                    "BuildingNumber": address.building_number,
+                    "StreetName": address.street,
+                    "CityName": address.town,
+                    "PostCodeZone": address.postcode,
+                }.items()
+                if value
+            },
+            {
+                key: value
+                for key, value in {
+                    "Forename": person_forename,
+                    "MiddleNames": person_middle_names,
+                    "Surname": person_surname,
+                }.items()
+                if value is not None
+            },
         )
 
         try:
@@ -429,10 +631,10 @@ class LandRegistryClient:
         property_address: str,
         postcode: str,
         title_number: Optional[str] = None,
+        building_name_or_number: Optional[str] = None,
     ) -> Optional[dict]:
         """Validate key LR business-rule criteria before sending live requests."""
-        clean_postcode = self._normalise_uk_postcode(postcode)
-        clean_address = (property_address or "").strip()
+        clean_postcode = normalise_postcode(postcode)
 
         # BRL-ISBG-011: validate title number format when provided.
         if title_number:
@@ -455,11 +657,17 @@ class LandRegistryClient:
             }
 
         # BRL-ISBG-081: minimum address details check.
-        building_part, street_part = self._split_address(clean_address)
-        has_building = bool(building_part)
-        has_street = bool(street_part)
+        parsed_address = self._apply_building_hint(
+            parse_address_for_oov(property_address, postcode),
+            building_name_or_number,
+        )
+        has_building = bool(
+            parsed_address.get("BuildingNumber")
+            or parsed_address.get("BuildingName")
+        )
+        has_street = bool(parsed_address.get("StreetName"))
         has_postcode = bool(clean_postcode)
-        has_city = self._looks_like_city_present(clean_address)
+        has_city = bool(parsed_address.get("CityName"))
         valid_address = has_building and (has_postcode or (has_street and has_city))
         if not valid_address:
             return {
@@ -488,13 +696,6 @@ class LandRegistryClient:
         candidate = title_number.strip().upper()
         return bool(re.match(r"^(?:[A-Y]{0,3}\d{1,6}|Z\d{1,6}Z)$", candidate))
 
-    def _normalise_uk_postcode(self, postcode: str) -> str:
-        """Normalise postcode to uppercase with a single inward-code separator space."""
-        compact = re.sub(r"\s+", "", (postcode or "").upper())
-        if len(compact) > 3:
-            return f"{compact[:-3]} {compact[-3:]}"
-        return compact
-
     def _normalise_name_for_oov(self, value: Optional[str], allow_spaces: bool) -> str:
         """Sanitise name values to characters accepted by the OOV request schema."""
         candidate = (value or "").strip()
@@ -507,12 +708,59 @@ class LandRegistryClient:
             cleaned = re.sub(r"[^A-Za-z0-9\-']", "", candidate)
         return cleaned
 
-    def _looks_like_city_present(self, full_address: str) -> bool:
-        """Detect whether a free-form address appears to include a town/city."""
-        # Simple heuristic: comma-separated address with at least 3 components
-        # usually includes town/city near the end.
-        parts = [p.strip() for p in full_address.split(",") if p.strip()]
-        return len(parts) >= 3
+    async def _resolve_city_name_from_postcode(
+        self,
+        postcode: str,
+        fallback_city: Optional[str],
+    ) -> Optional[str]:
+        """Resolve a CityName from postcodes.io, falling back to parsed localities."""
+        normalized_postcode = normalise_postcode(postcode)
+        if not normalized_postcode:
+            return fallback_city
+
+        cached = self._postcode_city_cache.get(normalized_postcode)
+        if cached:
+            return cached
+
+        lookup_url = (
+            f"https://api.postcodes.io/postcodes/"
+            f"{normalized_postcode.replace(' ', '%20')}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(lookup_url)
+            response.raise_for_status()
+            payload = response.json()
+            result = payload.get("result") or {}
+            city_name = (result.get("post_town") or result.get("admin_district") or "").strip()
+            if city_name:
+                self._postcode_city_cache[normalized_postcode] = city_name
+                return city_name
+        except Exception as exc:
+            logger.warning(
+                "postcodes.io lookup failed for postcode=%s: %s",
+                normalized_postcode,
+                exc,
+            )
+
+        return fallback_city
+
+    def _apply_building_hint(
+        self,
+        address_fields: dict[str, str],
+        building_name_or_number: Optional[str],
+    ) -> dict[str, str]:
+        """Fill missing address fields from an explicit building hint when available."""
+        hint = (building_name_or_number or "").strip()
+        if not hint:
+            return address_fields
+
+        hinted_fields = parse_address_for_oov(hint, "")
+        merged = dict(address_fields)
+        for key in ("SubBuildingName", "BuildingName", "BuildingNumber"):
+            if not merged.get(key) and hinted_fields.get(key):
+                merged[key] = hinted_fields[key]
+        return merged
 
     def _can_resolve_hostname(self, hostname: str) -> bool:
         """Return True when the target hostname can be resolved in this environment."""
@@ -557,10 +805,6 @@ class LandRegistryClient:
         pw_type = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
         username_xml = xml_escape(self._username or "")
         password_xml = xml_escape(self._password or "")
-        print("---" * 30)
-        print('*** Building WS-Security header with username "%s" and password %s', username_xml, password_xml)
-        
-        print("---" * 30)
         wsse_header = (
             "<wsse:Security>"
             "<wsse:UsernameToken>"
@@ -582,18 +826,21 @@ class LandRegistryClient:
             )
         elif request.address:
             addr = request.address
-            # BuildingNumber vs BuildingName: use BuildingNumber for numeric-
-            # looking values, BuildingName otherwise.
-            building_val = addr.building_name_or_number or ""
-            first_token = building_val.split()[0] if building_val.split() else ""
-            if (
-                first_token
-                .rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-                .isdigit()
-            ):
-                building_xml = f"<req:BuildingNumber>{xml_escape(building_val[:5])}</req:BuildingNumber>"
-            else:
-                building_xml = f"<req:BuildingName>{xml_escape(building_val[:50])}</req:BuildingName>"
+            sub_building_xml = (
+                f"<req:SubBuildingName>{xml_escape(addr.sub_building_name[:50])}</req:SubBuildingName>"
+                if addr.sub_building_name
+                else ""
+            )
+            building_name_xml = (
+                f"<req:BuildingName>{xml_escape(addr.building_name[:50])}</req:BuildingName>"
+                if addr.building_name
+                else ""
+            )
+            building_number_xml = (
+                f"<req:BuildingNumber>{xml_escape(addr.building_number[:5])}</req:BuildingNumber>"
+                if addr.building_number
+                else ""
+            )
             street_xml = (
                 f"<req:StreetName>{xml_escape(addr.street[:80])}</req:StreetName>"
                 if addr.street
@@ -612,7 +859,7 @@ class LandRegistryClient:
             subject_xml = (
                 "<req:SubjectProperty>"
                 "<req:PropertyAddress>"
-                f"{building_xml}{street_xml}{city_xml}{postcode_xml}"
+                f"{sub_building_xml}{building_name_xml}{building_number_xml}{street_xml}{city_xml}{postcode_xml}"
                 "</req:PropertyAddress>"
                 "</req:SubjectProperty>"
             )
@@ -639,7 +886,12 @@ class LandRegistryClient:
 
         forename_xml = f"<req:FirstForename>{xml_escape(first)}</req:FirstForename>"
         surname_xml = f"<req:Surname>{xml_escape(surname)}</req:Surname>"
-        middle_xml = ""
+        middle = self._normalise_name_for_oov(
+            request.person_name.middle_names, allow_spaces=True
+        )
+        middle_xml = (
+            f"<req:MiddleName>{xml_escape(middle)}</req:MiddleName>" if middle else ""
+        )
 
         # Indicators.
         skip_partial = not request.partial_match
@@ -834,17 +1086,14 @@ class LandRegistryClient:
                 title_number = str(subject.get("TitleNumber", "")).strip()
                 prop_addr = subject.get("PropertyAddress", {}) or {}
 
-                building_name = (
-                    prop_addr.get("BuildingNumber")
-                    or prop_addr.get("BuildingName")
-                    or prop_addr.get("SubBuildingName")
-                )
                 street = prop_addr.get("StreetName")
                 city = prop_addr.get("CityName")
                 postcode = prop_addr.get("PostcodeZone")
 
                 oov_address = OovAddress(
-                    building_name_or_number=building_name or "",
+                    sub_building_name=prop_addr.get("SubBuildingName"),
+                    building_name=prop_addr.get("BuildingName"),
+                    building_number=prop_addr.get("BuildingNumber"),
                     street=street,
                     town=city,
                     postcode=postcode,
@@ -910,35 +1159,3 @@ class LandRegistryClient:
             raw_status_code=raw_status,
             raw_body=raw_body,
         )
-
-    def _split_address(self, full_address: str) -> tuple[str, str]:
-        """Split a free-form address into building number/name and street."""
-        if not full_address:
-            return "", ""
-        
-        # Normalize whitespace and strip
-        addr = re.sub(r"\s+", " ", full_address.strip())
-        
-        # 1. Try splitting by comma first (e.g. "Woodstock, Brookfield Lane West")
-        if "," in addr:
-            parts = [p.strip() for p in addr.split(",", 1)]
-            building = parts[0].strip(",")
-            street = parts[1].strip(",")
-            if building and street:
-                return building, street
-        
-        # 2. Try splitting on first space (e.g. "10 Brookfield Lane West")
-        parts = addr.split(" ", 1)
-        if len(parts) == 1:
-            return parts[0].strip(","), ""
-        
-        return parts[0].strip(","), parts[1].strip(",")
-
-    def _split_name(self, full_name: str) -> tuple[Optional[str], Optional[str]]:
-        """Split a full name into simple forename and surname."""
-        if not full_name:
-            return None, None
-        tokens = full_name.strip().split()
-        if len(tokens) == 1:
-            return tokens[0], tokens[0]
-        return tokens[0], tokens[-1]

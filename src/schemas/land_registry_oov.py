@@ -8,13 +8,16 @@ class OovPersonName(BaseModel):
 
     title: Optional[str] = None
     forename: Optional[str] = None
+    middle_names: Optional[str] = None
     surname: Optional[str] = None
 
 
 class OovAddress(BaseModel):
     """Address payload for OOV requests and responses."""
 
-    building_name_or_number: str
+    sub_building_name: Optional[str] = None
+    building_name: Optional[str] = None
+    building_number: Optional[str] = None
     street: Optional[str] = None
     town: Optional[str] = None
     postcode: Optional[str] = None
@@ -62,4 +65,3 @@ class OovResponse(BaseModel):
     matches: List[OovMatchedTitle] = Field(default_factory=list)
     raw_status_code: int
     raw_body: Optional[str] = None
-

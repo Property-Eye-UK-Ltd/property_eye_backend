@@ -41,8 +41,10 @@ def event_loop() -> AsyncGenerator[asyncio.AbstractEventLoop, None]:
 async def prepare_test_database() -> AsyncGenerator[None, None]:
     """Create all tables in the test database before running tests."""
     # Import models to ensure they are registered on Base.metadata
+    import src.models.agency  # noqa: F401
     import src.models.fraud_match  # noqa: F401
     import src.models.property_listing  # noqa: F401
+    import src.models.register_extract  # noqa: F401
 
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
@@ -77,5 +79,4 @@ async def api_client() -> AsyncGenerator[httpx.AsyncClient, None]:
         yield client
 
     app.dependency_overrides.clear()
-
 

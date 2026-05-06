@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     HMLR_OOV_PATH: str = (
         "/b2b/EOOV_SoapEngine/OnlineOwnershipVerificationV1_0WebService"
     )
+    HMLR_RES_PATH: str = ""
     HMLR_BG_USERNAME: str
     HMLR_BG_PASSWORD: str
     HMLR_TLS_CERT_PATH: str
