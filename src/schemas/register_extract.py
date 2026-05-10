@@ -105,6 +105,7 @@ class AdminFraudCaseDetailSchema(AdminFraudCaseListItemSchema):
     ppd_full_address: Optional[str] = None
     address_similarity: float
     land_registry_response: Optional[str] = None
+    register_extract: Optional["RegisterExtractResponseSchema"] = None
 
 
 class AdminFraudCaseListResponseSchema(BaseModel):

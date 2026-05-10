@@ -122,31 +122,42 @@ class OCWithSummaryService:
 
         raw_xml: Optional[str] = None
         try:
-            soap_xml = self._build_request_xml(
+            client = self._get_client()
+            response, parsed = await self._send_request(
+                client=client,
                 report_id=fraud_match.id,
                 title_number=title_number,
                 customer_reference=fraud_match.property_listing.agency.name
                 if fraud_match.property_listing.agency
                 else fraud_match.property_listing.id,
                 description=fraud_match.property_listing.address,
-            )
-            logger.info(
-                "OC with Summary request | report_id=%s | title_number=%s | service_path=%s",
-                fraud_match.id,
-                title_number,
-                self._get_service_path(),
-            )
-            client = self._get_client()
-            response = await client.client.post(
-                self._get_service_path(),
-                content=soap_xml.encode("utf-8"),
-                headers={"Content-Type": "text/xml; charset=utf-8"},
+                expected_gross_price=None,
             )
             raw_xml = response.text
-            parsed = self._parse_response(
-                report_id=fraud_match.id,
-                raw_xml=raw_xml,
-            )
+            retry_price = self._extract_rejection_actual_price(raw_xml)
+            if (
+                parsed.status == "failed"
+                and parsed.error_message
+                and "bg.fee.feeMismatch" in parsed.error_message
+                and retry_price
+            ):
+                logger.info(
+                    "OC with Summary fee mismatch retry | report_id=%s | title_number=%s | actual_price=%s",
+                    fraud_match.id,
+                    title_number,
+                    retry_price,
+                )
+                response, parsed = await self._send_request(
+                    client=client,
+                    report_id=fraud_match.id,
+                    title_number=title_number,
+                    customer_reference=fraud_match.property_listing.agency.name
+                    if fraud_match.property_listing.agency
+                    else fraud_match.property_listing.id,
+                    description=fraud_match.property_listing.address,
+                    expected_gross_price=retry_price,
+                )
+                raw_xml = response.text
             await self._store_record(record, parsed, raw_xml, db)
             return parsed
         except Exception as exc:
@@ -169,6 +180,41 @@ class OCWithSummaryService:
             if self._client is not None:
                 await self._client.close()
                 self._client = None
+
+    async def _send_request(
+        self,
+        client: LandRegistryClient,
+        report_id: str,
+        title_number: str,
+        customer_reference: str,
+        description: Optional[str],
+        expected_gross_price: Optional[str],
+    ) -> tuple[Any, OCWithSummaryResponseSchema]:
+        """Send one OC with Summary request attempt and parse the response."""
+        soap_xml = self._build_request_xml(
+            report_id=report_id,
+            title_number=title_number,
+            customer_reference=customer_reference,
+            description=description,
+            expected_gross_price=expected_gross_price,
+        )
+        logger.info(
+            "OC with Summary request | report_id=%s | title_number=%s | service_path=%s | expected_gross_price=%s",
+            report_id,
+            title_number,
+            self._get_service_path(),
+            expected_gross_price,
+        )
+        response = await client.client.post(
+            self._get_service_path(),
+            content=soap_xml.encode("utf-8"),
+            headers={"Content-Type": "text/xml; charset=utf-8"},
+        )
+        parsed = self._parse_response(
+            report_id=report_id,
+            raw_xml=response.text,
+        )
+        return response, parsed
 
     async def _resolve_title_number(
         self,
@@ -343,6 +389,7 @@ class OCWithSummaryService:
         title_number: str,
         customer_reference: str,
         description: Optional[str],
+        expected_gross_price: Optional[str] = None,
     ) -> str:
         """Build the SOAP request envelope for RequestOCWithSummaryV2_0."""
         message_id = str(uuid.uuid4())
@@ -354,6 +401,13 @@ class OCWithSummaryService:
         wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
         req_ns = "http://www.oscre.org/ns/eReg-Final/2011/RequestOCWithSummaryV2_0"
         op_ns = "http://ocwithsummaryv2_1.ws.bg.lr.gov/"
+        expected_price_xml = (
+            "<req:ExpectedPrice>"
+            f'<req:GrossPriceAmount currencyID="GBP">{xml_escape(expected_gross_price)}</req:GrossPriceAmount>'
+            "</req:ExpectedPrice>"
+            if expected_gross_price
+            else ""
+        )
         pw_type = (
             "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
         )
@@ -382,6 +436,7 @@ class OCWithSummaryService:
             "<req:SubjectProperty>"
             f"<req:TitleNumber>{xml_escape(title_number)}</req:TitleNumber>"
             "</req:SubjectProperty>"
+            f"{expected_price_xml}"
             "<req:ExternalReference>"
             f"<req:Reference>{xml_escape(report_id[:25])}</req:Reference>"
             "<req:AllocatedBy>PropertyEye</req:AllocatedBy>"
@@ -407,6 +462,14 @@ class OCWithSummaryService:
             "</soapenv:Envelope>"
         )
         return body
+
+    def _extract_rejection_actual_price(self, raw_xml: str) -> Optional[str]:
+        """Extract the rejection gross price that BG calculated for the request."""
+        try:
+            parsed = xmltodict.parse(raw_xml)
+        except Exception:
+            return None
+        return self._extract_text(self._find_first_key(parsed, {"GrossPriceAmount"}))
 
     def _parse_response(
         self,

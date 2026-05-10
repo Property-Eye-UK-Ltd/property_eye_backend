@@ -33,6 +33,18 @@ from src.services.land_registry_client import LandRegistryClient
 
 logger = logging.getLogger(__name__)
 
+_TENURE_TYPE_MAP = {
+    "10": "Freehold",
+    "20": "Possessory Freehold",
+    "30": "Qualified Freehold",
+    "40": "Scheme Title - Freehold",
+    "50": "Scheme Title - Leasehold",
+    "60": "Leasehold",
+    "70": "Good Leasehold",
+    "80": "Qualified Leasehold",
+    "90": "Possessory Leasehold",
+}
+
 MOCK_TITLE_NUMBER = "GR506405"
 MOCK_PDF_BYTES = base64.b64decode(
     "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIg"
@@ -66,19 +78,27 @@ class RegisterExtractService:
         report_id: str,
         db: AsyncSession,
         mock: bool = False,
+        force_refresh: bool = False,
     ) -> RegisterExtractResponseSchema:
         fraud_match = await self._get_fraud_match(report_id, db)
         cached = fraud_match.register_extract
         logger.info(
-            "Register Extract request | report_id=%s | mock=%s | cache_status=%s | cached_title=%s | listing_title=%s | has_oov_response=%s",
+            "Register Extract request | report_id=%s | mock=%s | force_refresh=%s | cache_status=%s | cached_title=%s | listing_title=%s | has_oov_response=%s",
             report_id,
             mock,
+            force_refresh,
             cached.status if cached else None,
             cached.title_number if cached else None,
             fraud_match.property_listing.title_number or None,
             bool(fraud_match.land_registry_response),
         )
-        if cached and cached.status == "complete" and cached.parsed_json:
+        if force_refresh:
+            logger.info(
+                "Register Extract cache bypass | report_id=%s | existing_status=%s",
+                report_id,
+                cached.status if cached else None,
+            )
+        elif cached and cached.status == "complete" and cached.parsed_json:
             if self._should_refresh_cached_extract(cached.parsed_json, cached.raw_xml):
                 logger.info(
                     "Register Extract cache stale | report_id=%s | title_number=%s | refetching=true",
@@ -173,6 +193,16 @@ class RegisterExtractService:
         if isinstance(raw_xml, str) and ("<Fault" in raw_xml or "versionmismatch" in raw_xml.lower()):
             return True
 
+        if isinstance(raw_xml, str) and "EmbeddedFileBinaryObject" in raw_xml and not payload.get(
+            "official_copy_available"
+        ):
+            return True
+
+        for key in ("proprietors", "charges", "restrictions", "leases", "notices"):
+            items = payload.get(key)
+            if isinstance(items, list) and self._has_duplicate_payload_items(items):
+                return True
+
         detail_keys = ("proprietors", "charges", "restrictions", "leases", "notices", "quick_reference_flags")
         if any(payload.get(key) for key in detail_keys):
             return False
@@ -184,6 +214,18 @@ class RegisterExtractService:
             return True
 
         return True
+
+    def _has_duplicate_payload_items(self, items: list[Any]) -> bool:
+        """Detect obvious duplicate list entries in cached parsed payloads."""
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            signature = json.dumps(item, sort_keys=True, default=str)
+            if signature in seen:
+                return True
+            seen.add(signature)
+        return False
 
     async def get_pdf_bytes(
         self,
@@ -404,42 +446,39 @@ class RegisterExtractService:
         try:
             service_path = settings.HMLR_RES_PATH.strip() or client.oc_with_summary_path
 
-            request_xml = self._build_live_request_xml(
-                message_id=self._make_message_id(report_id),
-                title_number=title_number,
-                property_address=property_address,
-            )
-            logger.info(
-                "Register Extract live request | report_id=%s | service_path=%s | include_pdf=%s | title_number=%s | property_address=%s | request_bytes=%s",
-                report_id,
-                service_path,
-                include_pdf,
-                title_number,
-                property_address,
-                len(request_xml.encode("utf-8")),
-            )
-            response = await client.client.post(
-                service_path,
-                content=request_xml.encode("utf-8"),
-                headers={"Content-Type": "text/xml; charset=utf-8"},
-            )
-            preview = (response.text or "").replace("\n", " ").strip()
-            if len(preview) > 1000:
-                preview = f"{preview[:1000]}…"
-            logger.info(
-                "Register Extract live response | report_id=%s | status=%s | bytes=%s | preview=%s",
-                report_id,
-                response.status_code,
-                len(response.content or b""),
-                preview or "<empty>",
-            )
-            parsed = self._parse_live_response(
+            response, parsed = await self._send_live_extract_request(
+                client=client,
+                service_path=service_path,
                 report_id=report_id,
                 title_number=title_number,
-                raw_xml=response.text,
-                vendor_name=vendor_name,
                 property_address=property_address,
+                vendor_name=vendor_name,
+                include_pdf=include_pdf,
+                expected_gross_price=None,
             )
+            retry_price = self._extract_rejection_actual_price(response.text)
+            if (
+                parsed["payload"].status == "failed"
+                and parsed["payload"].error_message
+                and "bg.fee.feeMismatch" in parsed["payload"].error_message
+                and retry_price
+            ):
+                logger.info(
+                    "Register Extract fee mismatch retry | report_id=%s | title_number=%s | actual_price=%s",
+                    report_id,
+                    title_number,
+                    retry_price,
+                )
+                response, parsed = await self._send_live_extract_request(
+                    client=client,
+                    service_path=service_path,
+                    report_id=report_id,
+                    title_number=title_number,
+                    property_address=property_address,
+                    vendor_name=vendor_name,
+                    include_pdf=include_pdf,
+                    expected_gross_price=retry_price,
+                )
             logger.info(
                 "Register Extract parsed response | report_id=%s | status=%s | official_copy=%s | proprietor_count=%s | charge_count=%s | restriction_count=%s | lease_count=%s | notice_count=%s",
                 report_id,
@@ -476,17 +515,81 @@ class RegisterExtractService:
         finally:
             await client.close()
 
+    async def _send_live_extract_request(
+        self,
+        client: LandRegistryClient,
+        service_path: str,
+        report_id: str,
+        title_number: str,
+        property_address: str,
+        vendor_name: Optional[str],
+        include_pdf: bool,
+        expected_gross_price: Optional[str],
+    ) -> tuple[Any, dict[str, Any]]:
+        """Send one OC-with-summary request attempt and parse the response."""
+        message_id = self._new_message_id()
+        request_xml = self._build_live_request_xml(
+            message_id=message_id,
+            external_reference=report_id,
+            title_number=title_number,
+            property_address=property_address,
+            expected_gross_price=expected_gross_price,
+        )
+        logger.info(
+            "Register Extract live request | report_id=%s | message_id=%s | service_path=%s | include_pdf=%s | title_number=%s | property_address=%s | expected_gross_price=%s | request_bytes=%s",
+            report_id,
+            message_id,
+            service_path,
+            include_pdf,
+            title_number,
+            property_address,
+            expected_gross_price,
+            len(request_xml.encode("utf-8")),
+        )
+        response = await client.client.post(
+            service_path,
+            content=request_xml.encode("utf-8"),
+            headers={"Content-Type": "text/xml; charset=utf-8"},
+        )
+        preview = (response.text or "").replace("\n", " ").strip()
+        if len(preview) > 1000:
+            preview = f"{preview[:1000]}…"
+        logger.info(
+            "Register Extract live response | report_id=%s | status=%s | bytes=%s | preview=%s",
+            report_id,
+            response.status_code,
+            len(response.content or b""),
+            preview or "<empty>",
+        )
+        parsed = self._parse_live_response(
+            report_id=report_id,
+            title_number=title_number,
+            raw_xml=response.text,
+            vendor_name=vendor_name,
+            property_address=property_address,
+        )
+        return response, parsed
+
     def _build_live_request_xml(
         self,
         message_id: str,
+        external_reference: str,
         title_number: str,
         property_address: str,
+        expected_gross_price: Optional[str] = None,
     ) -> str:
-        ref = xml_escape(message_id[:25])
+        ref = xml_escape(external_reference[:25])
         description = xml_escape(property_address[:130] or title_number)
         title = xml_escape(title_number)
         username = xml_escape(settings.HMLR_BG_USERNAME)
         password = xml_escape(settings.HMLR_BG_PASSWORD)
+        expected_price_xml = (
+            "<req:ExpectedPrice>"
+            f'<req:GrossPriceAmount currencyID="GBP">{xml_escape(expected_gross_price)}</req:GrossPriceAmount>'
+            "</req:ExpectedPrice>"
+            if expected_gross_price
+            else ""
+        )
         i18n_ns = "http://www.w3.org/2005/09/ws-i18n"
         wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
         req_ns = "http://www.oscre.org/ns/eReg-Final/2011/RequestOCWithSummaryV2_0"
@@ -519,6 +622,7 @@ class RegisterExtractService:
             "<req:SubjectProperty>"
             f"<req:TitleNumber>{title}</req:TitleNumber>"
             "</req:SubjectProperty>"
+            f"{expected_price_xml}"
             "<req:ExternalReference>"
             f"<req:Reference>{ref}</req:Reference>"
             "<req:AllocatedBy>PropertyEye</req:AllocatedBy>"
@@ -682,10 +786,13 @@ class RegisterExtractService:
         attachment = self._find_first_key(results, {"Attachment"})
         attachment_bytes = self._extract_attachment_bytes(attachment)
 
-        property_address = self._extract_text(
-            self._find_first_key(summary, {"PropertyAddress", "PropertyDescription", "Description"})
+        property_address = self._join_address_parts(
+            self._find_first_key(summary, {"PropertyAddress"})
+            or self._find_first_key(register_data, {"PropertyAddress", "Address"})
+        ) or self._extract_text(
+            self._find_first_key(summary, {"PropertyDescription", "Description"})
         )
-        tenure = self._extract_text(self._find_first_key(summary, {"Tenure", "TenureDescription"}))
+        tenure = self._extract_tenure(summary, register_data)
         description = self._extract_text(
             self._find_first_key(register_data, {"PropertyDescription", "Description"})
         ) or property_address
@@ -699,6 +806,7 @@ class RegisterExtractService:
                 self._build_proprietor(node, vendor_name)
                 for node in self._find_nodes_by_fragment(register_data, "proprietor")
             ]
+        proprietors = self._dedupe_proprietors(proprietors)
 
         charges = self._build_entries(self._find_nodes_by_fragment(summary, "charge"))
         restrictions = self._build_entries(self._find_nodes_by_fragment(summary, "restriction"))
@@ -737,13 +845,25 @@ class RegisterExtractService:
         )
         return {"payload": payload, "attachment_bytes": attachment_bytes}
 
+    def _extract_rejection_actual_price(self, raw_xml: str) -> Optional[str]:
+        """Extract the gross price returned in a fee-mismatch rejection."""
+        try:
+            parsed = xmltodict.parse(raw_xml)
+        except Exception:
+            return None
+        return self._extract_text(self._find_first_key(parsed, {"GrossPriceAmount"}))
+
     def _build_proprietor(
         self,
         node: dict[str, Any],
         vendor_name: Optional[str],
     ) -> RegisterExtractProprietorSchema:
         name = self._extract_text(self._find_first_key(node, {"Name", "ProprietorName"}))
-        proprietor_type = self._extract_text(self._find_first_key(node, {"Type", "ProprietorType"})) or "Unknown"
+        proprietor_type = self._extract_text(self._find_first_key(node, {"Type", "ProprietorType"}))
+        if not proprietor_type and self._find_first_key(node, {"CompanyRegistrationNumber", "OrganisationName", "Organization"}):
+            proprietor_type = "Organisation"
+        if not proprietor_type and name:
+            proprietor_type = "Individual"
         address = self._join_address_parts(
             self._find_first_key(node, {"Address", "AddressDetails", "ProprietorAddress"}) or node
         )
@@ -771,7 +891,43 @@ class RegisterExtractService:
                     raw=node,
                 )
             )
-        return entries
+        return self._dedupe_entries(entries)
+
+    def _dedupe_proprietors(
+        self,
+        proprietors: list[RegisterExtractProprietorSchema],
+    ) -> list[RegisterExtractProprietorSchema]:
+        seen: set[tuple[str, str, str]] = set()
+        deduped: list[RegisterExtractProprietorSchema] = []
+        for proprietor in proprietors:
+            key = (
+                re.sub(r"\s+", " ", (proprietor.name or "").strip().upper()),
+                re.sub(r"\s+", " ", (proprietor.type or "").strip().upper()),
+                re.sub(r"\s+", " ", (proprietor.address or "").strip().upper()),
+            )
+            if key in seen or not any(key):
+                continue
+            seen.add(key)
+            deduped.append(proprietor)
+        return deduped
+
+    def _dedupe_entries(
+        self,
+        entries: list[RegisterExtractEntrySchema],
+    ) -> list[RegisterExtractEntrySchema]:
+        seen: set[tuple[str, str, str]] = set()
+        deduped: list[RegisterExtractEntrySchema] = []
+        for entry in entries:
+            key = (
+                (entry.entry_number or "").strip(),
+                re.sub(r"\s+", " ", (entry.entry_text or "").strip()),
+                (entry.registration_date or "").strip(),
+            )
+            if key in seen or not key[1]:
+                continue
+            seen.add(key)
+            deduped.append(entry)
+        return deduped
 
     def _find_first_key(self, value: Any, key_names: set[str]) -> Any:
         if isinstance(value, dict):
@@ -814,6 +970,7 @@ class RegisterExtractService:
                     "DocumentBinary",
                     "AttachmentBinaryObject",
                     "EmbeddedDocumentBinaryObject",
+                    "EmbeddedFileBinaryObject",
                     "Value",
                 },
             )
@@ -845,15 +1002,56 @@ class RegisterExtractService:
             return value.strip() or None
         if isinstance(value, dict):
             parts: list[str] = []
-            for key, child in value.items():
-                lowered = key.lower()
-                if "address" in lowered or "line" in lowered or "postcode" in lowered:
-                    text = self._extract_text(child)
-                    if text:
-                        parts.append(text)
+            ordered_keys = (
+                "BuildingName",
+                "SubBuildingName",
+                "BuildingNumber",
+                "StreetName",
+                "LocalityName",
+                "CitySubDivision1",
+                "CitySubDivision2",
+                "CityName",
+                "CountrySubentity",
+                "PostcodeZone",
+                "PostCodeZone",
+                "AddressLine",
+                "Line1",
+                "Line2",
+                "Line3",
+                "Line4",
+                "Line5",
+                "Line6",
+                "Line7",
+                "Line",
+            )
+            for key in ordered_keys:
+                child = self._find_first_key(value, {key})
+                text = self._extract_text(child)
+                if text:
+                    parts.append(text)
+            if not parts:
+                for key, child in value.items():
+                    lowered = key.lower()
+                    if "address" in lowered or "line" in lowered or "postcode" in lowered:
+                        text = self._extract_text(child)
+                        if text:
+                            parts.append(text)
             if parts:
                 return ", ".join(dict.fromkeys(parts))
         return None
+
+    def _extract_tenure(self, summary: Any, register_data: Any) -> Optional[str]:
+        tenure = self._extract_text(
+            self._find_first_key(summary, {"Tenure", "TenureDescription", "TitleAbsolute"})
+            or self._find_first_key(register_data, {"Tenure", "TenureDescription", "TitleAbsolute"})
+        )
+        if tenure:
+            return tenure
+        tenure_code = self._extract_text(
+            self._find_first_key(summary, {"TenureTypeCode", "ClassOfTitleCode"})
+            or self._find_first_key(register_data, {"TenureTypeCode", "ClassOfTitleCode"})
+        )
+        return _TENURE_TYPE_MAP.get(tenure_code or "", tenure_code)
 
     def _extract_text(self, value: Any) -> Optional[str]:
         if value is None:
@@ -878,8 +1076,9 @@ class RegisterExtractService:
         normalize = lambda value: re.sub(r"[^A-Z0-9]", "", value.upper())
         return normalize(left) == normalize(right)
 
-    def _make_message_id(self, report_id: str) -> str:
-        compact = re.sub(r"[^A-Za-z0-9\-]", "", report_id)[:40]
+    def _new_message_id(self) -> str:
+        """Generate a fresh BG-safe message ID for each submission attempt."""
+        compact = re.sub(r"[^A-Za-z0-9\-]", "", str(uuid.uuid4()))[:40]
         if len(compact) < 5:
             compact = f"pe-{uuid.uuid4().hex[:8]}"
         return compact

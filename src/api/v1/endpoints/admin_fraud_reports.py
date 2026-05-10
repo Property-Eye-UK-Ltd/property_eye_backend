@@ -168,6 +168,11 @@ async def get_admin_fraud_report(
         ppd_full_address=match.ppd_full_address,
         address_similarity=match.address_similarity,
         land_registry_response=match.land_registry_response,
+        register_extract=(
+            RegisterExtractResponseSchema.model_validate(match.register_extract.parsed_json)
+            if match.register_extract and match.register_extract.parsed_json
+            else None
+        ),
     )
 
 
@@ -178,17 +183,24 @@ async def get_admin_fraud_report(
 async def get_register_extract(
     report_id: str,
     mock: bool = Query(False),
+    force_refresh: bool = Query(False),
     db: AsyncSession = Depends(get_db),
 ):
     logger.info(
-        "Admin register extract route | report_id=%s | mock=%s | path=/api/v1/admin/fraud-reports/%s/register-extract",
+        "Admin register extract route | report_id=%s | mock=%s | force_refresh=%s | path=/api/v1/admin/fraud-reports/%s/register-extract",
         report_id,
         mock,
+        force_refresh,
         report_id,
     )
     service = RegisterExtractService()
     try:
-        payload = await service.get_or_fetch(report_id=report_id, db=db, mock=mock)
+        payload = await service.get_or_fetch(
+            report_id=report_id,
+            db=db,
+            mock=mock,
+            force_refresh=force_refresh,
+        )
         logger.info(
             "Admin register extract route completed | report_id=%s | status=%s | title_number=%s | official_copy_available=%s",
             report_id,
