@@ -11,6 +11,7 @@ import re
 import socket
 import ssl
 import uuid
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape as xml_escape
@@ -223,6 +224,37 @@ class OwnershipVerificationResult:
         self.raw_response = raw_response
 
 
+@dataclass
+class PropertyDescriptionMatch:
+    """Single property match returned by the Search by Property Description service."""
+
+    title_number: str
+    tenure: Optional[str] = None
+    building_name: Optional[str] = None
+    building_number: Optional[str] = None
+    street_name: Optional[str] = None
+    city_name: Optional[str] = None
+    postcode_zone: Optional[str] = None
+
+
+@dataclass
+class PropertyDescriptionSearchResult:
+    """Parsed result from the Search by Property Description service."""
+
+    status_code: str
+    status_message: Optional[str] = None
+    external_reference: Optional[str] = None
+    poll_id: Optional[str] = None
+    expected_response_datetime: Optional[str] = None
+    matches: list[PropertyDescriptionMatch] = field(default_factory=list)
+    raw_response: Optional[dict] = None
+
+    @property
+    def title_number(self) -> Optional[str]:
+        """Return the first matched title number, if any."""
+        return self.matches[0].title_number if self.matches else None
+
+
 class LandRegistryClient:
     """
     Client for HM Land Registry Online Owner Verification (OOV).
@@ -272,6 +304,26 @@ class LandRegistryClient:
         self._is_test_mode = is_test
         stub_or_engine = "EOOV_StubService" if is_test else "EOOV_SoapEngine"
         self._oov_path = f"/b2b/{stub_or_engine}/OnlineOwnershipVerificationV1_0WebService"
+        self._property_description_path = (
+            "/b2b/ECBG_StubService/EnquiryByPropertyDescriptionV2_0WebService"
+            if is_test
+            else "/b2b/BGSoapEngine/EnquiryByPropertyDescriptionV2_0WebService"
+        )
+        self._property_description_poll_path = (
+            "/b2b/ECBG_StubService/EnquiryByPropertyDescriptionV2_0PollWebService"
+            if is_test
+            else "/b2b/BGSoapEngine/EnquiryByPropertyDescriptionV2_0PollWebService"
+        )
+        self._oc_with_summary_path = (
+            "/b2b/ECBG_StubService/OfficialCopyWithSummaryV2_1WebService"
+            if is_test
+            else "/b2b/BGSoapEngine/OfficialCopyWithSummaryV2_1WebService"
+        )
+        self._oc_with_summary_poll_path = (
+            "/b2b/ECBG_StubService/OfficialCopyWithSummaryV2_1PollRequestWebService"
+            if is_test
+            else "/b2b/BGSoapEngine/OfficialCopyWithSummaryV2_1PollRequestWebService"
+        )
 
         # Build an explicit SSL context for mutual TLS and CA verification.
         # The CA bundle is resolved above so we can either reuse an existing
@@ -288,6 +340,16 @@ class LandRegistryClient:
             timeout=self._timeout,
         )
         self._postcode_city_cache: dict[str, str] = {}
+
+    @property
+    def oc_with_summary_path(self) -> str:
+        """Return the Business Gateway endpoint path for OC with Summary."""
+        return self._oc_with_summary_path
+
+    @property
+    def oc_with_summary_poll_path(self) -> str:
+        """Return the Business Gateway poll endpoint path for OC with Summary."""
+        return self._oc_with_summary_poll_path
 
     async def verify_owner(self, request: OovRequest) -> OovResponse:
         """
@@ -394,6 +456,422 @@ class LandRegistryClient:
         return self._parse_oov_response(
             response, fallback_reference=request.external_reference
         )
+
+    async def search_title_by_property_description(
+        self,
+        property_address: str,
+        postcode: str,
+        message_id: Optional[str] = None,
+        customer_reference: Optional[str] = None,
+    ) -> PropertyDescriptionSearchResult:
+        """
+        Search for a title number using HMLR's Search by Property Description service.
+
+        The service is used when a title number is not already stored on the
+        listing and must be discovered from the address before an official copy
+        can be requested.
+        """
+        address_fields = parse_address_for_oov(property_address, postcode)
+        address = OovAddress(
+            building_name=address_fields.get("BuildingName"),
+            building_number=address_fields.get("BuildingNumber"),
+            street=address_fields.get("StreetName"),
+            town=address_fields.get("CityName"),
+            postcode=address_fields.get("PostCodeZone"),
+        )
+        safe_id = self._make_message_id(message_id or str(uuid.uuid4()))
+        request_xml = self._build_property_description_request_xml(
+            message_id=safe_id,
+            customer_reference=customer_reference or safe_id,
+            address=address,
+            property_address=property_address,
+        )
+        logger.info(
+            "HMLR property description search request | message_id=%s | path=%s | address_fields=%s | request_bytes=%s",
+            safe_id,
+            self._property_description_path,
+            {
+                key: value
+                for key, value in {
+                    "BuildingName": address.building_name,
+                    "BuildingNumber": address.building_number,
+                    "StreetName": address.street,
+                    "CityName": address.town,
+                    "PostcodeZone": address.postcode,
+                }.items()
+                if value
+            },
+            len(request_xml.encode("utf-8")),
+        )
+
+        try:
+            response = await self.client.post(
+                self._property_description_path,
+                content=request_xml.encode("utf-8"),
+                headers={"Content-Type": "text/xml; charset=utf-8"},
+            )
+            preview = (response.text or "").replace("\n", " ").strip()
+            if len(preview) > 1000:
+                preview = f"{preview[:1000]}…"
+            logger.info(
+                "HMLR property description search response | message_id=%s | status=%s | bytes=%s | preview=%s",
+                safe_id,
+                response.status_code,
+                len(response.content or b""),
+                preview or "<empty>",
+            )
+            return self._parse_property_description_response(
+                response=response,
+                fallback_reference=safe_id,
+            )
+        except httpx.TimeoutException as exc:
+            logger.error("Timeout calling HMLR property description service: %s", exc)
+            return PropertyDescriptionSearchResult(
+                status_code="bg.timeout",
+                status_message="HMLR property description search timed out",
+                external_reference=safe_id,
+            )
+        except httpx.RequestError as exc:
+            logger.error("Request error calling HMLR property description service: %s", exc)
+            return PropertyDescriptionSearchResult(
+                status_code="bg.request.error",
+                status_message=str(exc),
+                external_reference=safe_id,
+            )
+
+    def _build_property_description_request_xml(
+        self,
+        message_id: str,
+        customer_reference: str,
+        address: OovAddress,
+        property_address: str,
+    ) -> str:
+        """Build SOAP XML for Search by Property Description."""
+        username = xml_escape(self._username or "")
+        password = xml_escape(self._password or "")
+        pw_type = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
+
+        wsse_header = (
+            "<wsse:Security>"
+            "<wsse:UsernameToken>"
+            f"<wsse:Username>{username}</wsse:Username>"
+            f'<wsse:Password Type="{pw_type}">{password}</wsse:Password>'
+            "</wsse:UsernameToken>"
+            "</wsse:Security>"
+            '<i18n:international xmlns:i18n="http://www.w3.org/2005/09/ws-i18n">'
+            "<i18n:locale>en</i18n:locale>"
+            "</i18n:international>"
+        )
+
+        building_name_xml = (
+            f"<req:BuildingName>{xml_escape(address.building_name[:50])}</req:BuildingName>"
+            if address.building_name
+            else ""
+        )
+        building_number_xml = (
+            f"<req:BuildingNumber>{xml_escape(address.building_number[:5])}</req:BuildingNumber>"
+            if address.building_number
+            else ""
+        )
+        street_xml = (
+            f"<req:StreetName>{xml_escape(address.street[:80])}</req:StreetName>"
+            if address.street
+            else ""
+        )
+        city_xml = (
+            f"<req:CityName>{xml_escape(address.town[:35])}</req:CityName>"
+            if address.town
+            else ""
+        )
+        postcode_xml = (
+            f"<req:PostcodeZone>{xml_escape(address.postcode[:8])}</req:PostcodeZone>"
+            if address.postcode
+            else ""
+        )
+        description = xml_escape((property_address or "")[:500])
+        req_ns = "http://www.oscre.org/ns/eReg-Final/2011/RequestSearchByPropertyDescriptionV2_0"
+        op_ns = "http://epdv2_0.ws.bg.lr.gov/"
+
+        request_payload = (
+            "<req:ID>"
+            f"<req:MessageID>{xml_escape(message_id)}</req:MessageID>"
+            "</req:ID>"
+            "<req:Product>"
+            "<req:ExternalReference>"
+            f"<req:Reference>{xml_escape(message_id[:25])}</req:Reference>"
+            "<req:AllocatedBy>PropertyEye</req:AllocatedBy>"
+            f"<req:Description>{description}</req:Description>"
+            "</req:ExternalReference>"
+            "<req:CustomerReference>"
+            f"<req:Reference>{xml_escape(customer_reference[:25])}</req:Reference>"
+            "<req:AllocatedBy>PropertyEye</req:AllocatedBy>"
+            f"<req:Description>{description}</req:Description>"
+            "</req:CustomerReference>"
+            "<req:SubjectProperty>"
+            "<req:Address>"
+            f"{building_name_xml}{building_number_xml}{street_xml}{city_xml}{postcode_xml}"
+            "</req:Address>"
+            "</req:SubjectProperty>"
+            "</req:Product>"
+        )
+        body = (
+            f"<epd:searchProperties xmlns:epd=\"{op_ns}\" xmlns:req=\"{req_ns}\">"
+            f"<arg0>{request_payload}</arg0>"
+            "</epd:searchProperties>"
+        )
+
+        wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+            f' xmlns:wsse="{wsse_ns}">'
+            f"<soapenv:Header>{wsse_header}</soapenv:Header>"
+            f"<soapenv:Body>{body}</soapenv:Body>"
+            "</soapenv:Envelope>"
+        )
+
+    def _find_first_key(self, value: object, key_names: set[str]) -> object | None:
+        """Walk a nested dict/list structure and return the first matching key."""
+        if isinstance(value, dict):
+            for key, child in value.items():
+                local_key = key.split(":")[-1]
+                if key in key_names or local_key in key_names:
+                    return child
+                found = self._find_first_key(child, key_names)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = self._find_first_key(item, key_names)
+                if found is not None:
+                    return found
+        return None
+
+    def _extract_text(self, value: object) -> Optional[str]:
+        """Extract a plain text value from xmltodict output."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            cleaned = re.sub(r"\s+", " ", value).strip()
+            return cleaned or None
+        if isinstance(value, dict):
+            for key in ("#text", "Text", "Description", "Value", "Reference", "Reason", "Code"):
+                if key in value:
+                    return self._extract_text(value[key])
+            parts = [self._extract_text(item) for item in value.values()]
+            joined = " ".join([part for part in parts if part])
+            return joined or None
+        if isinstance(value, list):
+            parts = [self._extract_text(item) for item in value]
+            joined = " ".join([part for part in parts if part])
+            return joined or None
+        return str(value)
+
+    def _parse_property_description_response(
+        self,
+        response: httpx.Response,
+        fallback_reference: Optional[str] = None,
+    ) -> PropertyDescriptionSearchResult:
+        """Parse Search by Property Description SOAP XML into a structured result."""
+        raw_body = response.text
+        raw_status = response.status_code
+
+        try:
+            parsed = xmltodict.parse(
+                raw_body,
+                process_namespaces=True,
+                namespaces={
+                    "http://schemas.xmlsoap.org/soap/envelope/": "soapenv",
+                },
+            )
+        except Exception as exc:
+            logger.error("Failed to parse property description XML response: %s", exc)
+            return PropertyDescriptionSearchResult(
+                status_code="bg.parse.error",
+                status_message=str(exc),
+                external_reference=fallback_reference,
+                raw_response={"raw_status": raw_status, "raw_body": raw_body},
+            )
+
+        soap_fault = self._find_first_key(parsed, {"Fault"})
+        if isinstance(soap_fault, dict):
+            fault_code = self._extract_text(soap_fault.get("faultcode")) or "bg.soap.fault"
+            fault_string = self._extract_text(soap_fault.get("faultstring")) or "SOAP fault returned by HMLR."
+            logger.error(
+                "Property description SOAP fault | reference=%s | code=%s | message=%s",
+                fallback_reference,
+                fault_code,
+                fault_string,
+            )
+            return PropertyDescriptionSearchResult(
+                status_code="bg.soap.fault",
+                status_message=f"{fault_code}: {fault_string}",
+                external_reference=fallback_reference,
+                raw_response=parsed,
+            )
+
+        gateway_response = self._find_first_key(parsed, {"GatewayResponse"}) or parsed
+        type_code = str(self._extract_text(self._find_first_key(gateway_response, {"TypeCode"})) or "").strip()
+        external_reference = (
+            self._extract_text(self._find_first_key(gateway_response, {"Reference"}))
+            or fallback_reference
+        )
+
+        if type_code == "10":
+            expected = self._extract_text(
+                self._find_first_key(gateway_response, {"ExpectedResponseDateTime"})
+            )
+            message = (
+                self._extract_text(
+                    self._find_first_key(gateway_response, {"MessageDescription", "Reason"})
+                )
+                or "Service is not currently available. System has queued your request, please poll at specified time."
+            )
+            logger.info(
+                "Property description search queued | reference=%s | expected_at=%s | message=%s",
+                external_reference,
+                expected,
+                message,
+            )
+            return PropertyDescriptionSearchResult(
+                status_code="bg.acknowledgement",
+                status_message=message,
+                external_reference=external_reference,
+                poll_id=external_reference,
+                expected_response_datetime=expected,
+                raw_response=parsed,
+            )
+
+        if type_code == "20":
+            rejection = self._find_first_key(gateway_response, {"Rejection"}) or {}
+            reason = self._extract_text(self._find_first_key(rejection, {"Reason", "MessageDescription"}))
+            code = self._extract_text(self._find_first_key(rejection, {"Code"})) or "bg.rejection"
+            logger.warning(
+                "Property description search rejected | reference=%s | code=%s | reason=%s",
+                external_reference,
+                code,
+                reason,
+            )
+            return PropertyDescriptionSearchResult(
+                status_code=code,
+                status_message=reason or "Property description search rejected.",
+                external_reference=external_reference,
+                raw_response=parsed,
+            )
+
+        matches = self._extract_property_description_matches(gateway_response)
+        if not matches:
+            logger.warning(
+                "Property description search returned no matches | reference=%s | raw_status=%s",
+                external_reference,
+                raw_status,
+            )
+            return PropertyDescriptionSearchResult(
+                status_code="bg.properties.nopropertyfound",
+                status_message=(
+                    "No title number has been identified from the data supplied. "
+                    "This does not necessarily mean that a register of a title does not exist but only that insufficient data has matched."
+                ),
+                external_reference=external_reference,
+                raw_response=parsed,
+            )
+
+        logger.info(
+            "Property description search succeeded | reference=%s | match_count=%s",
+            external_reference,
+            len(matches),
+        )
+        return PropertyDescriptionSearchResult(
+            status_code="bg.match.found" if len(matches) == 1 else "bg.properties.multiple",
+            status_message=None,
+            external_reference=external_reference,
+            matches=matches,
+            raw_response=parsed,
+        )
+
+    def _extract_property_description_matches(
+        self,
+        value: object,
+    ) -> list[PropertyDescriptionMatch]:
+        """Extract property-description matches from a parsed SOAP response."""
+        results = self._find_first_key(value, {"Results"})
+        title_nodes = self._find_all_keys(results if results is not None else value, {"Title"})
+        candidates: list[dict[str, object]] = [
+            node for node in title_nodes if isinstance(node, dict)
+        ]
+
+        matches: list[PropertyDescriptionMatch] = []
+        seen: set[str] = set()
+        for node in candidates:
+            title_number = self._extract_text(
+                self._find_first_key(node, {"TitleNumber"})
+            )
+            if not title_number:
+                continue
+            cleaned_title = title_number.strip().upper()
+            if cleaned_title in seen:
+                continue
+            seen.add(cleaned_title)
+            matches.append(
+                PropertyDescriptionMatch(
+                    title_number=cleaned_title,
+                    tenure=self._extract_text(self._find_first_key(node, {"Tenure"})),
+                    building_name=self._extract_text(self._find_first_key(node, {"BuildingName"})),
+                    building_number=self._extract_text(self._find_first_key(node, {"BuildingNumber"})),
+                    street_name=self._extract_text(self._find_first_key(node, {"StreetName"})),
+                    city_name=self._extract_text(self._find_first_key(node, {"CityName"})),
+                    postcode_zone=self._extract_text(self._find_first_key(node, {"PostcodeZone"})),
+                )
+            )
+
+        if matches:
+            return self._select_best_property_description_match(matches)
+        return matches
+
+    def _find_all_keys(self, value: object, key_names: set[str]) -> list[object]:
+        """Walk a nested dict/list structure and return all matching keys."""
+        matches: list[object] = []
+        if isinstance(value, dict):
+            for key, child in value.items():
+                local_key = key.split(":")[-1]
+                if key in key_names or local_key in key_names:
+                    matches.append(child)
+                matches.extend(self._find_all_keys(child, key_names))
+        elif isinstance(value, list):
+            for item in value:
+                matches.extend(self._find_all_keys(item, key_names))
+        return matches
+
+    def _select_best_property_description_match(
+        self,
+        matches: list[PropertyDescriptionMatch],
+    ) -> list[PropertyDescriptionMatch]:
+        """Rank matches by how closely they resemble the input address."""
+        # Keep the implementation simple and deterministic: prefer the most
+        # specific match by address completeness and return that first.
+        def score(match: PropertyDescriptionMatch) -> tuple[int, int]:
+            filled = sum(
+                1
+                for value in (
+                    match.building_name,
+                    match.building_number,
+                    match.street_name,
+                    match.city_name,
+                    match.postcode_zone,
+                )
+                if value and str(value).strip()
+            )
+            postcode_bonus = 1 if match.postcode_zone else 0
+            return (filled, postcode_bonus)
+
+        return sorted(matches, key=score, reverse=True)
+
+    def _make_message_id(self, source: str) -> str:
+        """Build a BG-safe message/reference identifier."""
+        compact = re.sub(r"[^A-Za-z0-9\-]", "", (source or ""))[:40]
+        if len(compact) < 5:
+            compact = f"pe-{uuid.uuid4().hex[:8]}"
+        return compact
 
     async def verify_ownership(
         self,

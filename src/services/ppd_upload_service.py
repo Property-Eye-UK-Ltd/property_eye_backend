@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.session import AsyncSessionLocal
@@ -81,6 +81,21 @@ class PPDUploadService:
             )
         )
 
+    async def _mark_upload_failed(self, upload_id: str, error_message: str) -> None:
+        """Persist a failed upload state using a fresh session."""
+        async with AsyncSessionLocal() as session:
+            stmt = (
+                update(PPDUploadJob)
+                .where(PPDUploadJob.id == upload_id)
+                .values(
+                    status="failed",
+                    error_message=error_message,
+                    processed_at=datetime.utcnow(),
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
     async def restore_upload_file(
         self,
         upload_id: str,
@@ -112,6 +127,7 @@ class PPDUploadService:
                 job.status = "uploaded"
                 job.error_message = None
                 job.records_processed = None
+                job.uploaded_at = datetime.utcnow()
                 job.processed_at = None
                 await session.commit()
 
@@ -196,18 +212,8 @@ class PPDUploadService:
             except Exception as e:
                 logger.error(f"Error processing upload {upload_id}: {str(e)}")
                 await session.rollback()
-
-                # Update job status to failed
                 try:
-                    stmt = select(PPDUploadJob).where(PPDUploadJob.id == upload_id)
-                    result = await session.execute(stmt)
-                    job = result.scalar_one_or_none()
-
-                    if job:
-                        job.status = "failed"
-                        job.error_message = str(e)
-                        job.processed_at = datetime.utcnow()
-                        await session.commit()
+                    await self._mark_upload_failed(upload_id, str(e))
                 except Exception as update_error:
                     logger.error(f"Failed to update job status: {str(update_error)}")
 

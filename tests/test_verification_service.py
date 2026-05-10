@@ -32,6 +32,33 @@ class FakeLandRegistryClientSuccess:
         )
 
 
+class FakeLandRegistryClientSuccessWithTitle:
+    """Fake Land Registry client that confirms ownership and returns a title number."""
+
+    async def verify_ownership(
+        self,
+        property_address: str,
+        postcode: str,
+        expected_owner_name: str,
+        message_id: str = None,
+        **kwargs,
+    ) -> OwnershipVerificationResult:
+        """Return a successful ownership verification result with a title number."""
+        return OwnershipVerificationResult(
+            owner_name=expected_owner_name,
+            verification_status="ok",
+            error_message=None,
+            raw_response={
+                "matches": [
+                    {
+                        "title_number": "GR506405",
+                        "owner_name": expected_owner_name,
+                    }
+                ]
+            },
+        )
+
+
 class FakeLandRegistryClientMismatch:
     """Fake Land Registry client that always returns a different owner."""
 
@@ -127,6 +154,48 @@ async def test_verify_single_match_confirmed_fraud(db_session: AsyncSession) -> 
     assert result.is_confirmed_fraud is True
     assert result.verified_owner_name == listing.client_name
     assert refreshed is not None and refreshed.verification_status == "confirmed_fraud"
+
+
+@pytest.mark.asyncio
+async def test_verify_single_match_backfills_title_number_from_oov_response(
+    db_session: AsyncSession,
+) -> None:
+    """Verify that a successful OOV response backfills the listing title number."""
+    listing = PropertyListing(
+        agency_id="agency-title",
+        address="123 High Street",
+        normalized_address="123 HIGH STREET",
+        postcode="AB1 2CD",
+        client_name="John Smith",
+        status="active",
+        created_at=datetime.now(timezone.utc),
+    )
+    db_session.add(listing)
+    await db_session.flush()
+
+    fraud_match = FraudMatch(
+        property_listing_id=listing.id,
+        ppd_transaction_id="tx-title",
+        ppd_price=350000,
+        ppd_transfer_date=datetime(2024, 1, 1),
+        ppd_postcode="AB1 2CD",
+        ppd_full_address="123 High Street",
+        confidence_score=95.0,
+        address_similarity=96.0,
+        risk_level="HIGH",
+        detected_at=datetime.now(timezone.utc),
+    )
+    db_session.add(fraud_match)
+    await db_session.commit()
+
+    service = VerificationService(
+        land_registry_client=FakeLandRegistryClientSuccessWithTitle()
+    )
+
+    await service.verify_single_match(fraud_match.id, db_session)
+
+    refreshed_listing = await db_session.get(PropertyListing, listing.id)
+    assert refreshed_listing is not None and refreshed_listing.title_number == "GR506405"
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ from src.api import deps
 from src.core import security
 from src.db.session import get_db
 from src.models.agency import Agency
-from src.schemas.agency import AgencyCreate, AgencyLogin, Token, AgencyResponse
+from src.schemas.agency import AgencyCreate, AgencyLogin, Token, AgencyResponse, AgencyChangePassword
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -71,6 +71,37 @@ async def login(login_data: AgencyLogin, db: AsyncSession = Depends(get_db)):
         "agency_name": agency.name,
         "agency_id": agency.id
     }
+
+
+@router.post("/change-password")
+async def change_password(data: AgencyChangePassword, db: AsyncSession = Depends(get_db)):
+    """
+    Change agency password with a confirmation passcode.
+    """
+    if data.confirm_passcode != "0000":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid confirmation passcode",
+        )
+
+    # Find agency by username
+    stmt = select(Agency).where(Agency.username == data.username)
+    result = await db.execute(stmt)
+    agency = result.scalars().first()
+
+    if not agency:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agency not found",
+        )
+
+    # Update password
+    agency.hashed_password = security.get_password_hash(data.new_password)
+    # Optional: Invalidate current token if any
+    agency.access_token = None
+    
+    await db.commit()
+    return {"message": "Password updated successfully"}
 
 
 @router.post("/logout")

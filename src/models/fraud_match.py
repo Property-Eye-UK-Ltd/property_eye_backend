@@ -88,6 +88,12 @@ class FraudMatch(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    oc_with_summary = relationship(
+        "OCWithSummary",
+        back_populates="fraud_match",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return (

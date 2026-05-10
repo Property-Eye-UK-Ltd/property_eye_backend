@@ -195,6 +195,11 @@ class VerificationService:
             fraud_match.land_registry_response = (
                 json.dumps(api_result.raw_response) if api_result.raw_response else None
             )
+            title_number = self._extract_title_number_from_oov_response(
+                api_result.raw_response
+            )
+            if title_number and not (property_listing.title_number or "").strip():
+                property_listing.title_number = title_number
             fraud_match.verified_at = datetime.utcnow()
 
             # API/infrastructure failure — could not complete verification.
@@ -418,3 +423,25 @@ class VerificationService:
         )
 
         return is_match
+
+    def _extract_title_number_from_oov_response(
+        self,
+        raw_response: Optional[dict],
+    ) -> str:
+        """Extract the matched title number from a stored OOV response payload."""
+        if not isinstance(raw_response, dict):
+            return ""
+
+        matches = raw_response.get("matches")
+        if isinstance(matches, dict):
+            matches = [matches]
+        if not isinstance(matches, list):
+            return ""
+
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            title_number = match.get("title_number") or match.get("titleNumber")
+            if isinstance(title_number, str) and title_number.strip():
+                return title_number.strip().upper()
+        return ""

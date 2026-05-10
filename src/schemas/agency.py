@@ -28,6 +28,14 @@ class AgencyLogin(BaseModel):
     password: str
 
 
+class AgencyChangePassword(BaseModel):
+    """Schema for changing agency password."""
+
+    username: str
+    new_password: str
+    confirm_passcode: str
+
+
 class Token(BaseModel):
     """Schema for JWT token."""
 

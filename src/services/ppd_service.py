@@ -232,6 +232,14 @@ class PPDService:
 
         scan_window = scan_window_months or config.SCAN_WINDOW_MONTHS
 
+        parquet_files = list(self.volume_path.glob("year=*/ppd_*.parquet"))
+        if not parquet_files:
+            logger.error(
+                "[DuckDB Scan] No PPD parquet files available under %s",
+                self.volume_path,
+            )
+            raise FileNotFoundError("records not present for this year")
+
         # Build date range filter
         min_date: Optional[date] = None
         max_date: Optional[date] = None

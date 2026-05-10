@@ -17,6 +17,7 @@ from src.api.v1.endpoints import (
     documents,
     fraud_reports,
     integrations_alto,
+    oc_with_summary,
     ppd_upload,
     verification,
 )
@@ -130,6 +131,7 @@ app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
 app.include_router(agencies.router, prefix=settings.API_V1_PREFIX)
 app.include_router(documents.router, prefix=settings.API_V1_PREFIX)
 app.include_router(fraud_reports.router, prefix=settings.API_V1_PREFIX)
+app.include_router(oc_with_summary.router, prefix=settings.API_V1_PREFIX)
 app.include_router(ppd_upload.router, prefix=settings.API_V1_PREFIX)
 app.include_router(verification.router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin_alto.router, prefix=settings.API_V1_PREFIX)

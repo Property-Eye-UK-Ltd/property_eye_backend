@@ -1,5 +1,7 @@
 """Admin fraud-case endpoints for cross-agency review and RES retrieval."""
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, inspect, or_, select
@@ -20,6 +22,7 @@ from src.schemas.register_extract import (
 from src.services.register_extract_service import RegisterExtractService
 
 router = APIRouter(prefix="/admin/fraud-reports", tags=["admin-fraud-reports"])
+logger = logging.getLogger(__name__)
 
 
 async def _has_register_extract_table(db: AsyncSession) -> bool:
@@ -177,10 +180,29 @@ async def get_register_extract(
     mock: bool = Query(False),
     db: AsyncSession = Depends(get_db),
 ):
+    logger.info(
+        "Admin register extract route | report_id=%s | mock=%s | path=/api/v1/admin/fraud-reports/%s/register-extract",
+        report_id,
+        mock,
+        report_id,
+    )
     service = RegisterExtractService()
     try:
-        return await service.get_or_fetch(report_id=report_id, db=db, mock=mock)
+        payload = await service.get_or_fetch(report_id=report_id, db=db, mock=mock)
+        logger.info(
+            "Admin register extract route completed | report_id=%s | status=%s | title_number=%s | official_copy_available=%s",
+            report_id,
+            payload.status,
+            payload.title_number,
+            payload.official_copy_available,
+        )
+        return payload
     except ValueError as exc:
+        logger.warning(
+            "Admin register extract route failed | report_id=%s | error=%s",
+            report_id,
+            exc,
+        )
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
@@ -190,6 +212,12 @@ async def download_register_extract_pdf(
     mock: bool = Query(False),
     db: AsyncSession = Depends(get_db),
 ):
+    logger.info(
+        "Admin register extract PDF route | report_id=%s | mock=%s | path=/api/v1/admin/fraud-reports/%s/register-extract/pdf",
+        report_id,
+        mock,
+        report_id,
+    )
     service = RegisterExtractService()
     try:
         pdf_bytes, filename = await service.get_pdf_bytes(
@@ -197,7 +225,18 @@ async def download_register_extract_pdf(
             db=db,
             mock=mock,
         )
+        logger.info(
+            "Admin register extract PDF route completed | report_id=%s | filename=%s | bytes=%s",
+            report_id,
+            filename,
+            len(pdf_bytes),
+        )
     except ValueError as exc:
+        logger.warning(
+            "Admin register extract PDF route failed | report_id=%s | error=%s",
+            report_id,
+            exc,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return StreamingResponse(
