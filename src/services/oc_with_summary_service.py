@@ -353,13 +353,14 @@ class OCWithSummaryService:
         i18n_ns = "http://www.w3.org/2005/09/ws-i18n"
         wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
         req_ns = "http://www.oscre.org/ns/eReg-Final/2011/RequestOCWithSummaryV2_0"
+        op_ns = "http://ocwithsummaryv2_1.ws.bg.lr.gov/"
         pw_type = (
             "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
         )
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
-            f'xmlns:wsse="{wsse_ns}" xmlns:req="{req_ns}" xmlns:i18n="{i18n_ns}">'
+            f'xmlns:wsse="{wsse_ns}" xmlns:req="{req_ns}" xmlns:i18n="{i18n_ns}" xmlns:oc="{op_ns}">'
             "<soapenv:Header>"
             "<wsse:Security>"
             "<wsse:UsernameToken>"
@@ -372,7 +373,8 @@ class OCWithSummaryService:
             "</i18n:international>"
             "</soapenv:Header>"
             "<soapenv:Body>"
-            '<req:RequestOCWithSummaryV2_0>'
+            "<oc:performOCWithSummary>"
+            "<arg0>"
             "<req:ID>"
             f"<req:MessageID>{xml_escape(message_id)}</req:MessageID>"
             "</req:ID>"
@@ -395,11 +397,12 @@ class OCWithSummaryService:
             "<req:NotifyIfPendingFirstRegistrationIndicator>false</req:NotifyIfPendingFirstRegistrationIndicator>"
             "<req:NotifyIfPendingApplicationIndicator>false</req:NotifyIfPendingApplicationIndicator>"
             "<req:SendBackDatedIndicator>false</req:SendBackDatedIndicator>"
-            "<req:ContinueIfActualFeeExceedsExpectedFeeIndicator>false</req:ContinueIfActualFeeExceedsExpectedFeeIndicator>"
+            "<req:ContinueIfActualFeeExceedsExpectedFeeIndicator>true</req:ContinueIfActualFeeExceedsExpectedFeeIndicator>"
             "<req:IncludeTitlePlanIndicator>false</req:IncludeTitlePlanIndicator>"
             "</req:TitleKnownOfficialCopy>"
             "</req:Product>"
-            "</req:RequestOCWithSummaryV2_0>"
+            "</arg0>"
+            "</oc:performOCWithSummary>"
             "</soapenv:Body>"
             "</soapenv:Envelope>"
         )
@@ -413,7 +416,9 @@ class OCWithSummaryService:
         """Parse OC with Summary SOAP XML into the application schema."""
         parsed = xmltodict.parse(raw_xml)
         gateway_response = self._find_first_key(parsed, {"GatewayResponse"}) or {}
-        type_code = str(self._extract_text(gateway_response.get("TypeCode")) or "").strip()
+        type_code = str(
+            self._extract_text(self._find_first_key(gateway_response, {"TypeCode"})) or ""
+        ).strip()
 
         if type_code == "10":
             ack = self._find_first_key(gateway_response, {"Acknowledgement"}) or {}

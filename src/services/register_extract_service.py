@@ -490,13 +490,14 @@ class RegisterExtractService:
         i18n_ns = "http://www.w3.org/2005/09/ws-i18n"
         wsse_ns = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
         req_ns = "http://www.oscre.org/ns/eReg-Final/2011/RequestOCWithSummaryV2_0"
+        op_ns = "http://ocwithsummaryv2_1.ws.bg.lr.gov/"
         pw_type = (
             "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
         )
         return (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
-            f'xmlns:wsse="{wsse_ns}" xmlns:req="{req_ns}" xmlns:i18n="{i18n_ns}">'
+            f'xmlns:wsse="{wsse_ns}" xmlns:req="{req_ns}" xmlns:i18n="{i18n_ns}" xmlns:oc="{op_ns}">'
             "<soapenv:Header>"
             "<wsse:Security>"
             "<wsse:UsernameToken>"
@@ -509,7 +510,8 @@ class RegisterExtractService:
             "</i18n:international>"
             "</soapenv:Header>"
             "<soapenv:Body>"
-            "<req:RequestOCWithSummaryV2_0>"
+            "<oc:performOCWithSummary>"
+            "<arg0>"
             "<req:ID>"
             f"<req:MessageID>{xml_escape(message_id)}</req:MessageID>"
             "</req:ID>"
@@ -532,11 +534,12 @@ class RegisterExtractService:
             "<req:NotifyIfPendingFirstRegistrationIndicator>false</req:NotifyIfPendingFirstRegistrationIndicator>"
             "<req:NotifyIfPendingApplicationIndicator>false</req:NotifyIfPendingApplicationIndicator>"
             "<req:SendBackDatedIndicator>false</req:SendBackDatedIndicator>"
-            "<req:ContinueIfActualFeeExceedsExpectedFeeIndicator>false</req:ContinueIfActualFeeExceedsExpectedFeeIndicator>"
+            "<req:ContinueIfActualFeeExceedsExpectedFeeIndicator>true</req:ContinueIfActualFeeExceedsExpectedFeeIndicator>"
             "<req:IncludeTitlePlanIndicator>false</req:IncludeTitlePlanIndicator>"
             "</req:TitleKnownOfficialCopy>"
             "</req:Product>"
-            "</req:RequestOCWithSummaryV2_0>"
+            "</arg0>"
+            "</oc:performOCWithSummary>"
             "</soapenv:Body>"
             "</soapenv:Envelope>"
         )
@@ -551,7 +554,9 @@ class RegisterExtractService:
     ) -> dict[str, Any]:
         parsed = xmltodict.parse(raw_xml)
         gateway_response = self._find_first_key(parsed, {"GatewayResponse"}) or {}
-        type_code = str(self._extract_text(gateway_response.get("TypeCode")) or "").strip()
+        type_code = str(
+            self._extract_text(self._find_first_key(gateway_response, {"TypeCode"})) or ""
+        ).strip()
         logger.info(
             "Register Extract gateway response | report_id=%s | type_code=%s",
             report_id,
@@ -623,10 +628,16 @@ class RegisterExtractService:
 
         if type_code == "20":
             rejection = self._find_first_key(gateway_response, {"Rejection"}) or {}
-            reason = self._extract_text(rejection.get("Reason")) or "Register extract request rejected."
+            rejection_response = self._find_first_key(rejection, {"RejectionResponse"}) or rejection
+            reason = (
+                self._extract_text(self._find_first_key(rejection_response, {"Reason"}))
+                or "Register extract request rejected."
+            )
+            code = self._extract_text(self._find_first_key(rejection_response, {"Code"}))
             logger.warning(
-                "Register Extract response type=rejection | report_id=%s | reason=%s",
+                "Register Extract response type=rejection | report_id=%s | code=%s | reason=%s",
                 report_id,
+                code or None,
                 reason,
             )
             payload = RegisterExtractResponseSchema(
@@ -636,7 +647,7 @@ class RegisterExtractService:
                 status="failed",
                 property=RegisterExtractPropertySchema(),
                 official_copy_available=False,
-                error_message=reason,
+                error_message=f"{code}: {reason}" if code else reason,
             )
             return {"payload": payload, "attachment_bytes": None}
 
@@ -765,7 +776,8 @@ class RegisterExtractService:
     def _find_first_key(self, value: Any, key_names: set[str]) -> Any:
         if isinstance(value, dict):
             for key, child in value.items():
-                if key in key_names:
+                local_key = key.split(":")[-1]
+                if key in key_names or local_key in key_names:
                     return child
                 found = self._find_first_key(child, key_names)
                 if found is not None:
